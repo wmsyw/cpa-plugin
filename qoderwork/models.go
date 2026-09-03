@@ -15,23 +15,95 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+var retiredUpstreamModelIDs = map[string]struct{}{
+	"q36fmodel": {},
+}
+
+var publicModelIDs = map[string]string{
+	"auto":          "auto",
+	"qmodel_38max":  "qwen3.8-max",
+	"qmodel_latest": "qwen3.7-max",
+	"qmodel":        "qwen3.7-plus",
+	"q37fmodel":     "qwen3.7-flash",
+	"dmodel":        "deepseek-v4-pro",
+	"dfmodel":       "deepseek-v4-flash",
+	"gmodel":        "glm-5.3",
+	"gm51model":     "glm-5.2",
+	"kmodel":        "kimi-k2.7-code",
+	"mmodel":        "minimax-m2.7",
+}
+
+func publicModelID(upstreamID string) string {
+	if id, ok := publicModelIDs[upstreamID]; ok {
+		return id
+	}
+	return upstreamID
+}
+
+func publicModels(models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
+	out := make([]pluginapi.ModelInfo, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		if _, retired := retiredUpstreamModelIDs[model.ID]; retired {
+			continue
+		}
+		model.ID = publicModelID(model.ID)
+		key := strings.ToLower(model.ID)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, model)
+	}
+	return out
+}
+
 // wbModels is the static fallback model list for QoderWork CN. Keys mirror
 // /root/qoderwork/models_list.json (KNOWLEDGE §6.2). Aliases use the qoder/
 // prefix in AuthAttributes; bare IDs work too. Dynamic refresh via
 // /algo/api/v2/model/list replaces this at runtime when an account is present.
-func wbModels() []pluginapi.ModelInfo {
-	return []pluginapi.ModelInfo{
-		{ID: "auto", Name: "Auto", ContextLength: 180000, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "qmodel_preview", Name: "Qwen3.8-Max-Preview", ContextLength: 180000, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "qmodel_latest", Name: "Qwen3.7-Max", ContextLength: 180000, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "qmodel", Name: "Qwen3.7-Plus", ContextLength: 180000, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "q36fmodel", Name: "Qwen3.6-Flash", ContextLength: 180000, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "dmodel", Name: "DeepSeek-V4-Pro", ContextLength: 180000, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "dfmodel", Name: "DeepSeek-V4-Flash", ContextLength: 180000, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "gm51model", Name: "GLM-5.2", ContextLength: 180000, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "kmodel", Name: "Kimi-K2.7-Code", ContextLength: 180000, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
-		{ID: "mmodel", Name: "MiniMax-M2.7", ContextLength: 180000, MaxCompletionTokens: 8192, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+func ensurePublicFallbackModels(models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
+	seen := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		seen[strings.ToLower(model.ID)] = struct{}{}
 	}
+	for _, fallback := range publicModels(wbModels()) {
+		if _, exists := seen[strings.ToLower(fallback.ID)]; exists {
+			continue
+		}
+		models = append(models, fallback)
+	}
+	return models
+}
+
+func wbModels() []pluginapi.ModelInfo {
+	models := []pluginapi.ModelInfo{
+		{ID: "auto", Name: "Auto", ContextLength: 180000, MaxCompletionTokens: 32000, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "qmodel_38max", Name: "Qwen3.8-Max", ContextLength: 180000, MaxCompletionTokens: 131072, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "qmodel_latest", Name: "Qwen3.7-Max", ContextLength: 180000, MaxCompletionTokens: 131072, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "qmodel", Name: "Qwen3.7-Plus", ContextLength: 180000, MaxCompletionTokens: 131072, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "q37fmodel", Name: "Qwen3.7-Flash", ContextLength: 200000, MaxCompletionTokens: 131072, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "dmodel", Name: "DeepSeek-V4-Pro", ContextLength: 180000, MaxCompletionTokens: 393216, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "dfmodel", Name: "DeepSeek-V4-Flash", ContextLength: 180000, MaxCompletionTokens: 393216, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "gmodel", Name: "GLM-5.3", ContextLength: 180000, MaxCompletionTokens: 131072, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "gm51model", Name: "GLM-5.2", ContextLength: 180000, MaxCompletionTokens: 131072, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "kmodel", Name: "Kimi-K2.7-Code", ContextLength: 180000, MaxCompletionTokens: 131072, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+		{ID: "mmodel", Name: "MiniMax-M2.7", ContextLength: 180000, MaxCompletionTokens: 131072, OwnedBy: providerName, SupportedGenerationMethods: []string{"chat"}},
+	}
+	for i := range models {
+		models[i].ContextLength = fallbackContextLength(models[i].ID, models[i].ContextLength)
+	}
+	return models
+}
+
+func officialMaxCompletionTokens(modelKey string, fallback int64) int64 {
+	switch modelKey {
+	case "qmodel_38max", "qmodel_latest", "qmodel", "q37fmodel", "gmodel", "gm51model", "kmodel", "mmodel":
+		return 131072
+	case "dmodel", "dfmodel":
+		return 393216
+	}
+	return fallback
 }
 
 func cachedDynamicModels() ([]pluginapi.ModelInfo, bool) {
@@ -140,37 +212,58 @@ func callModelsAPI(sa *storedAuth) ([]pluginapi.ModelInfo, error) {
 		return nil, fmt.Errorf("no chat scene in models response")
 	}
 	var models []struct {
-		Key            string  `json:"key"`
-		DisplayName    string  `json:"display_name"`
-		Enable         bool    `json:"enable"`
-		IsReasoning    bool    `json:"is_reasoning"`
-		IsVL           bool    `json:"is_vl"`
-		MaxInputTokens int64   `json:"max_input_tokens"`
-		PriceFactor    float64 `json:"price_factor"`
+		Key             string                         `json:"key"`
+		DisplayName     string                         `json:"display_name"`
+		Enable          bool                           `json:"enable"`
+		IsReasoning     bool                           `json:"is_reasoning"`
+		IsVL            bool                           `json:"is_vl"`
+		MaxInputTokens  int64                          `json:"max_input_tokens"`
+		MaxOutputTokens int64                          `json:"max_output_tokens"`
+		PriceFactor     float64                        `json:"price_factor"`
+		ContextConfig   map[string]contextWindowOption `json:"context_config"`
 	}
 	if err := json.Unmarshal(chatRaw, &models); err != nil {
 		return nil, fmt.Errorf("chat scene parse: %w", err)
 	}
 	var out []pluginapi.ModelInfo
+	nextOneMillionModels := make(map[string]struct{})
+	sawContextConfig := false
 	for _, m := range models {
 		if !m.Enable {
 			continue
 		}
+		if len(m.ContextConfig) > 0 {
+			sawContextConfig = true
+		}
+		hasOneMillion := contextConfigHasWindow(m.ContextConfig, oneMillionContextWindow)
+		if hasOneMillion {
+			nextOneMillionModels[m.Key] = struct{}{}
+		}
 		ctx2 := int64(180000)
+		maxOutput := int64(8192)
+		if m.MaxOutputTokens > 0 {
+			maxOutput = m.MaxOutputTokens
+		}
 		if m.MaxInputTokens > 0 {
 			ctx2 = m.MaxInputTokens
+		}
+		if hasOneMillion {
+			ctx2 = oneMillionContextWindow
 		}
 		out = append(out, pluginapi.ModelInfo{
 			ID:                         m.Key,
 			Name:                       m.DisplayName,
 			ContextLength:              ctx2,
-			MaxCompletionTokens:        8192,
+			MaxCompletionTokens:        officialMaxCompletionTokens(m.Key, maxOutput),
 			OwnedBy:                    providerName,
 			SupportedGenerationMethods: []string{"chat"},
 		})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("no enabled chat models")
+	}
+	if sawContextConfig {
+		storeOneMillionContextModels(nextOneMillionModels)
 	}
 	return out, nil
 }
@@ -216,6 +309,11 @@ func resolveUpstreamModel(model string, attributes map[string]string) string {
 	modelAliasCache.RUnlock()
 	if ok {
 		return name
+	}
+	for upstreamID, publicID := range publicModelIDs {
+		if strings.EqualFold(m, publicID) {
+			return upstreamID
+		}
 	}
 	return m
 }
@@ -321,7 +419,7 @@ func handleModelStatic(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	cacheModelAliases(req.Host)
-	models := fetchDynamicModels()
+	models := publicModels(wbModels())
 	models = filterExcludedModels(models, req.Host)
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
 }
@@ -336,7 +434,8 @@ func handleModelForAuth(raw []byte) ([]byte, error) {
 	// req.AuthProvider back would silently drop the model list whenever the
 	// auth file carries a non-canonical provider string.
 	cacheModelAliases(req.Host)
-	models := fetchDynamicModelsFromStorage(req.StorageJSON)
+	models := publicModels(fetchDynamicModelsFromStorage(req.StorageJSON))
+	models = ensurePublicFallbackModels(models)
 	models = filterExcludedModels(models, req.Host)
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
 }

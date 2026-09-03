@@ -61,6 +61,7 @@ func configure(raw []byte) {
 	nextLifecycleAuto := true
 	nextSchedulerMode := schedulerModeOff // reset to default on reconfigure
 	nextKeepaliveAuto := true
+	nextPromptMode := promptModeProxy
 	nextMgmtKey := ""
 
 	cfgURL, cfgKey := "", ""
@@ -104,6 +105,10 @@ func configure(raw []byte) {
 					v = strings.Trim(v, "\"'")
 					nextKeepaliveAuto = v == "true" || v == "1" || v == "yes" || v == "on"
 				}
+				if strings.HasPrefix(line, "prompt_mode:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "prompt_mode:"))
+					nextPromptMode = normalizePromptMode(strings.Trim(v, "\"'"))
+				}
 			}
 		}
 	}
@@ -124,6 +129,8 @@ func configure(raw []byte) {
 	keepaliveAutoMu.Lock()
 	keepaliveAuto = nextKeepaliveAuto
 	keepaliveAutoMu.Unlock()
+
+	setPromptMode(nextPromptMode)
 
 	// management key: config_yaml > env > keep existing. Empty stays empty
 	// (plugin-layer auth disabled, host middleware still guards).

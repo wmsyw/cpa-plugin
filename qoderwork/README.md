@@ -13,6 +13,7 @@
 | **每日签到** | 面板手动签到（单账号/批量）+ 09:00/21:00 定时自动签到，签到后返回最新积分快照 |
 | **积分面板** | 账号卡片：昵称/积分/计划/签到状态/操作（签到/刷新/选用） |
 | **token 保活** | 22:00 定时刷新；按 token 前缀路由（drt- → deviceToken/refresh，jrt- → jobToken/refresh），PAT 永不劫持 OAuth 刷新 |
+| **代理中立模式** | 默认无损透传调用方 messages/tools/tool_choice，不注入 Qoder 身份和内置工具；可切换 `native` 兼容原生 Qoder Agent |
 | **auth 隔离** | 文件名前缀 `qoderwork-` 过滤，与 workbuddy 等其他插件互不干扰 |
 
 ## 安装
@@ -42,15 +43,20 @@ plugins:
   configs:
     qoderwork:
       enabled: true
+      prompt_mode: proxy # proxy（默认，适合外部 Agent）或 native（原生 Qoder 提示词/工具）
 
 # 模型别名（可选）
 oauth-model-alias:
   qoderwork:
-    - name: qmodel_preview
+    - name: qmodel_38max
       alias: qoder/qwen3.8-max
+    - name: gmodel
+      alias: qoder/glm-5.3
     - name: qmodel_latest
       alias: qoder/qwen3.7-max
 ```
+
+`prompt_mode: proxy` 保留 Qoder 传输信封、COSY 签名和模型上下文设置，但移除内置 Qoder 系统提示词/工具，并无损透传调用方消息、工具调用与工具结果。`prompt_mode: native` 用于需要原生 Qoder CLI Agent 行为的兼容场景。
 
 ## 使用
 
@@ -88,7 +94,7 @@ auth 文件字段（可共存）：
 
 ## 模型
 
-10 个静态模型（`qmodel_preview` 等）+ COSY 动态拉取。CPA 侧别名示例：`qoder/qwen3.8-max` → `qmodel_preview`。
+11 个静态模型（`qmodel_38max`、`gmodel` 等）+ COSY 动态拉取。CPA 侧别名示例：`qoder/qwen3.8-max` → `qmodel_38max`。
 
 ## 参考文档
 

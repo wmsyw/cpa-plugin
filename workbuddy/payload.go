@@ -17,6 +17,11 @@ import (
 // single unmarshal/marshal pass (v0.6.31 perf: was 4-5 full JSON round-trips
 // on every chat completion). The 4 legacy helpers remain for tests and other
 // call sites that need them individually.
+//
+// Context capacity is deliberately not sent as a request control: CodeBuddy's
+// Chat Completions API derives the accepted input window from the selected
+// model. The upstream catalog's maxInputTokens/maxAllowedSize is used for
+// client-facing metadata so callers compact only at that model's real limit.
 func prepareUpstreamBody(payload, original []byte, sa *storedAuth, upstreamModel string) []byte {
 	src := payload
 	if len(src) == 0 {
@@ -36,15 +41,28 @@ func prepareUpstreamBody(payload, original []byte, sa *storedAuth, upstreamModel
 	// 2. normalizeTools: tool_choice object form → string; "none" suppresses tools.
 	normalizeToolsInPlace(obj)
 
-	// 3. rewriteSystem: strip blocked Claude Code template phrases + force thinking.
+	// 3. normalize roles first: both CN and Global gateways reject the
+	// OpenAI-only "developer" role with 11128. Converting before the content
+	// rewrite lets identity templates inside developer messages be sanitized
+	// under their post-conversion system role.
+	normalizeDeveloperRoleInPlace(obj)
+
+	// 4. rewriteSystem: strip blocked Claude Code template phrases.
 	rewriteSystemInPlace(obj)
 
-	// 4. ensureSystemMessage: inject minimal system msg for Global only.
+	// 5. desensitize: insert zero-width separators into provider-blocked
+	// terms across system/developer prompt text, marker-bearing user text,
+	// and tool description/title fields (ported from Sliverkiss/cpa-plugin
+	// v0.9.3). Runs after the role conversion and identity rewrite so every
+	// scanned field is normalized once, in order.
+	applyDesensitizeInPlace(obj)
+
+	// 6. ensureSystemMessage: inject minimal system msg for Global only.
 	ensureSystemMessageInPlace(obj, sa)
 
-	// 5. rewriteModel: swap client model name to upstream model id.
+	// 7. rewriteModel and translate official reasoning efforts to upstream labels.
 	rewriteModelInPlace(obj, upstreamModel)
-
+	mapReasoningEffortInPlace(obj, upstreamModel)
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return src
@@ -125,8 +143,26 @@ func rewriteSystemInPlace(obj map[string]any) bool {
 			changed = true
 		}
 	}
-	if forceMaxThinking(obj) {
-		changed = true
+	return changed
+}
+
+// normalizeDeveloperRoleInPlace converts the OpenAI-only "developer" role to
+// "system". Both CN (copilot.tencent.com) and Global (www.workbuddy.ai)
+// gateways reject the developer role with code 11128 ("Illegal API invocation
+// from an unapproved channel"); live-probed 2026-09-03. Relative message order
+// is preserved; only the role label changes.
+func normalizeDeveloperRoleInPlace(obj map[string]any) bool {
+	messages, _ := obj["messages"].([]any)
+	changed := false
+	for _, m := range messages {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := msg["role"].(string); strings.EqualFold(role, "developer") {
+			msg["role"] = "system"
+			changed = true
+		}
 	}
 	return changed
 }
@@ -307,9 +343,6 @@ func rewriteSystemForUpstream(payload []byte) []byte {
 			changed = true
 		}
 	}
-	if forceMaxThinking(obj) {
-		changed = true
-	}
 	if !changed {
 		return payload
 	}
@@ -401,19 +434,40 @@ func sanitizeBlockedTemplates(s string) string {
 	return s
 }
 
-// forceMaxThinking pins reasoning_effort to "high" for hy3-family models so
-// Tencent Hunyuan 3 always reasons at maximum depth. CodeBuddy only honors
-// "high" for deep thinking (medium/low/max/xhigh/ultra all fall back to no
-// reasoning), so we override whatever the client sent. Returns true if changed.
-func forceMaxThinking(obj map[string]any) bool {
-	model, _ := obj["model"].(string)
-	if !strings.HasPrefix(model, "hy3") {
+// mapReasoningEffortInPlace translates official-model effort names to the
+// labels accepted by WorkBuddy. Clients can therefore consistently send the
+// official values low/high/max.
+func mapReasoningEffortInPlace(obj map[string]any, model string) bool {
+	effort, _ := obj["reasoning_effort"].(string)
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	if effort == "" {
 		return false
 	}
-	if eff, _ := obj["reasoning_effort"].(string); eff == "high" {
+	mapped := effort
+	switch model {
+	case "kimi-k3-1", "deepseek-v4-pro", "deepseek-v4-flash", "glm-5.3", "glm-5.3-flash", "glm-5.2":
+		if effort == "max" {
+			mapped = "xhigh"
+		}
+	case "hy3", "hy3-preview", "hy3-preview-agent", "hy3-x":
+		// WorkBuddy's Hunyuan routes only honor high for deep thinking.
+		if effort == "max" {
+			mapped = "high"
+		}
+	case "hy4-preview", "hy4-preview-x":
+		// Both Hy4 Preview tiers expose only none/high: map the compatible
+		// OpenAI ladder to their no-think/deep-think endpoints.
+		switch effort {
+		case "low":
+			mapped = "none"
+		case "medium", "xhigh", "max":
+			mapped = "high"
+		}
+	}
+	if mapped == effort {
 		return false
 	}
-	obj["reasoning_effort"] = "high"
+	obj["reasoning_effort"] = mapped
 	return true
 }
 

@@ -173,8 +173,12 @@ func displayNote(sa *storedAuth, cr *creditsSummary, disabled bool) string {
 // labelForAuth adds [CN] for host labels.
 func labelForAuth(sa *storedAuth) string {
 	base := "QoderWork"
-	if sa != nil && strings.TrimSpace(sa.Account.Nickname) != "" {
-		base = strings.TrimSpace(sa.Account.Nickname)
+	if sa != nil {
+		if nickname := strings.TrimSpace(sa.Account.Nickname); nickname != "" {
+			base = nickname
+		} else if uid := strings.TrimSpace(sa.Account.UID); uid != "" {
+			base = uid
+		}
 	}
 	tag := "CN"
 	if "cn" == "global" {

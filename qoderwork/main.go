@@ -68,6 +68,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -349,6 +350,7 @@ func wbRegistration() registration {
 				{Name: "checkin_auto", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable daily auto check-in at 09:00 and 21:00 local time for CN accounts (default true)."},
 				{Name: "lifecycle_auto", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Auto disable CN when credits exhausted; re-enable CN after check-in restores credits (default true)."},
 				{Name: "token_keepalive", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable daily access-token refresh at 22:00 local time to prevent Keycloak offline-session expiry (default true)."},
+				{Name: "prompt_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{promptModeProxy, promptModeNative}, Description: "Prompt handling: proxy forwards caller messages/tools without Qoder prompt injection (default); native retains the embedded Qoder agent prompt and tools."},
 				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Optional model list. Each item can have id, name, alias, context, max_tokens, enabled, reasoning."},
 				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{schedulerModeOff, schedulerModeCredits}, Description: "Multi-account selection: off (defer to built-in, default) or credits (pick highest remaining). WARNING: when off + lifecycle_auto=false, exhausted accounts may still be routed — enable lifecycle_auto or set scheduler_mode=credits."},
 				{Name: "usage_report_url", Type: pluginapi.ConfigFieldTypeString, Description: "Optional override of CPAMP usage import URL (default http://cpa-manager-plus:18317/v0/management/usage/import; also env USAGE_REPORT_URL)."},
@@ -522,6 +524,7 @@ func parseStored(raw []byte) (*storedAuth, error) {
 	if sa.Auth.AccessToken == "" {
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}
+	rememberUsageAccount(&sa)
 	return &sa, nil
 }
 
@@ -669,17 +672,18 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	if sa.Account.UID != "" {
 		authUID = sa.Account.UID
 	}
+	reasoning := requestedReasoningEffort(req.Payload, req.Metadata)
 	// Build the QoderWork agent_chat_generation body from the OpenAI request,
 	// then QoderEncoding-encode it. The template embeds a 10657-token system
 	// prompt that the server requires for normal behaviour (KNOWLEDGE §5.2).
 	qwReq := &openAIRequest{}
 	if err := json.Unmarshal(req.Payload, qwReq); err != nil && len(req.Payload) > 0 {
-		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, "payload parse: "+err.Error())
+		publishUsage(clientVisibleModel(req.Metadata, req.Model), upstreamModel, authUID, started, usage.Detail{}, true, 0, "payload parse: "+err.Error(), reasoning, 0)
 		return nil, fmt.Errorf("payload parse: %w", err)
 	}
 	body, err := buildQoderBody(qwReq, upstreamModel, uiUserType(nil))
 	if err != nil {
-		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, "body build: "+err.Error())
+		publishUsage(clientVisibleModel(req.Metadata, req.Model), upstreamModel, authUID, started, usage.Detail{}, true, 0, "body build: "+err.Error(), reasoning, 0)
 		return nil, fmt.Errorf("body build: %w", err)
 	}
 	encodedBody := qoderEncode(body)
@@ -688,30 +692,30 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	if err := applyCosyHeaders(httpReq, sa, encodedBody, endpointChat, upstreamModel, true); err != nil {
-		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, "cosy: "+err.Error())
+		publishUsage(clientVisibleModel(req.Metadata, req.Model), upstreamModel, authUID, started, usage.Detail{}, true, 0, "cosy: "+err.Error(), reasoning, 0)
 		return nil, fmt.Errorf("cosy: %w", err)
 	}
 	// Compliance: route via host.http.do_stream so request-log captures the
 	// outbound call. Read entire body via the bridge, then fold SSE → completion.
 	stream, statusCode, _, err := hostHTTPDoStream(httpReq)
 	if err != nil {
-		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
+		publishUsage(clientVisibleModel(req.Metadata, req.Model), upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error(), reasoning, 0)
 		return nil, fmt.Errorf("http_error: %w", err)
 	}
 	defer stream.Close()
 	reader := newHostStreamReader(stream)
 	if statusCode >= 400 {
 		payload, _ := io.ReadAll(reader)
-		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, string(payload))
+		publishUsage(clientVisibleModel(req.Metadata, req.Model), upstreamModel, authUID, started, usage.Detail{}, true, statusCode, string(payload), reasoning, 0)
 		reconcileAfterExecutorError(req.AuthID, statusCode, string(payload))
 		return nil, fmt.Errorf("upstream %d: %s", statusCode, truncateRedacted(string(payload), 200))
 	}
 	completion, err := aggregateQoderSSE(reader, req.Model)
 	if err != nil {
-		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
+		publishUsage(clientVisibleModel(req.Metadata, req.Model), upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error(), reasoning, 0)
 		return nil, err
 	}
-	publishUsage(req.Model, upstreamModel, authUID, started, usageDetailFromCompletion(completion), false, 0, "")
+	publishUsage(clientVisibleModel(req.Metadata, req.Model), upstreamModel, authUID, started, usageDetailFromCompletion(completion), false, 0, "", reasoning, 0)
 	invalidateAccountCredits(req.AuthID, authUID)
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
 }
@@ -723,6 +727,59 @@ func stripProviderPrefix(model string) string {
 		return model[i+1:]
 	}
 	return model
+}
+
+// clientVisibleModel resolves the user-facing model name for usage reporting.
+// The host rewrites ExecutorRequest.Model to the upstream model key, but keeps
+// the client-requested model (the configured alias) in request metadata under
+// the requested_model key. Prefer it so request monitoring shows the alias
+// the user actually called, not the internal upstream key.
+func clientVisibleModel(metadata map[string]any, model string) string {
+	if len(metadata) > 0 {
+		if raw, ok := metadata[executor.RequestedModelMetadataKey]; ok {
+			switch value := raw.(type) {
+			case string:
+				if trimmed := strings.TrimSpace(value); trimmed != "" {
+					return strings.TrimSpace(stripProviderPrefix(trimmed))
+				}
+			case []byte:
+				if trimmed := strings.TrimSpace(string(value)); trimmed != "" {
+					return strings.TrimSpace(stripProviderPrefix(trimmed))
+				}
+			}
+		}
+	}
+	return strings.TrimSpace(stripProviderPrefix(model))
+}
+
+// requestedReasoningEffort reads the client reasoning effort from the request
+// body when present (QoderWork gateway accepts reasoning_effort).
+func requestedReasoningEffort(payload []byte, metadata map[string]any) string {
+	if len(payload) > 0 {
+		var probe struct {
+			ReasoningEffort string `json:"reasoning_effort"`
+		}
+		if json.Unmarshal(payload, &probe) == nil {
+			if strings.TrimSpace(probe.ReasoningEffort) != "" {
+				return strings.TrimSpace(probe.ReasoningEffort)
+			}
+		}
+	}
+	if len(metadata) > 0 {
+		if raw, ok := metadata[executor.ReasoningEffortMetadataKey]; ok {
+			switch value := raw.(type) {
+			case string:
+				if strings.TrimSpace(value) != "" {
+					return strings.TrimSpace(value)
+				}
+			case []byte:
+				if strings.TrimSpace(string(value)) != "" {
+					return strings.TrimSpace(string(value))
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // executorStreamRequest wraps the host's executor.execute_stream RPC: the
@@ -748,6 +805,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if sa.Account.UID != "" {
 		authUID = sa.Account.UID
 	}
+	reasoning := requestedReasoningEffort(req.Payload, req.Metadata)
 
 	// Build the QoderWork body (template-based) and QoderEncoding-encode.
 	bodyRaw := req.Payload
@@ -756,12 +814,12 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	}
 	qwReq := &openAIRequest{}
 	if err := json.Unmarshal(bodyRaw, qwReq); err != nil && len(bodyRaw) > 0 {
-		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, "payload parse: "+err.Error())
+		publishUsage(clientVisibleModel(req.Metadata, req.Model), upstreamModel, authUID, started, usage.Detail{}, true, 0, "payload parse: "+err.Error(), reasoning, 0)
 		return nil, fmt.Errorf("payload parse: %w", err)
 	}
 	body, err := buildQoderBody(qwReq, upstreamModel, uiUserType(nil))
 	if err != nil {
-		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, "body build: "+err.Error())
+		publishUsage(clientVisibleModel(req.Metadata, req.Model), upstreamModel, authUID, started, usage.Detail{}, true, 0, "body build: "+err.Error(), reasoning, 0)
 		return nil, fmt.Errorf("body build: %w", err)
 	}
 	encodedBody := qoderEncode(body)
@@ -774,10 +832,10 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		collector := &sseUsageCollector{}
 		chunks, statusCode, errCollect := collectUpstreamStreamQoder(encodedBody, sa, upstreamModel, sseFramed, collector)
 		if errCollect != nil {
-			publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, errCollect.Error())
+			publishUsage(clientVisibleModel(req.Metadata, req.Model), upstreamModel, authUID, started, usage.Detail{}, true, statusCode, errCollect.Error(), reasoning, collector.ttftSince(started))
 			return nil, errCollect
 		}
-		publishUsage(req.Model, upstreamModel, authUID, started, collector.detail(), false, 0, "")
+		publishUsage(clientVisibleModel(req.Metadata, req.Model), upstreamModel, authUID, started, collector.detail(), false, 0, "", reasoning, collector.ttftSince(started))
 		invalidateAccountCredits(req.AuthID, authUID)
 		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
 	}
@@ -801,7 +859,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		streamClose(req.StreamID)
 		return okEnvelope(streamResponse{Headers: headers})
 	}
-	go pumpUpstreamStream(httpReq, cancel, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started, req.AuthID)
+	go pumpUpstreamStream(httpReq, cancel, req.StreamID, sseFramed, clientVisibleModel(req.Metadata, req.Model), upstreamModel, authUID, started, req.AuthID, reasoning)
 	return okEnvelope(streamResponse{Headers: headers})
 }
 
