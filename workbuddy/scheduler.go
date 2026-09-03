@@ -1,24 +1,24 @@
-// scheduler.go implements WorkBuddy's CPA scheduler.pick capability.
+// scheduler.go implements the CPA scheduler.pick capability for workbuddy.
 //
-// Credits mode follows the panel-selected account. Expiry mode instead uses
-// fresh cached package metadata to spend credits with the earliest deductible
-// deadline first. Neither scheduler path performs network I/O.
+// Routing uses the panel-selected active account (region from that card's
+// domain). When the selection is exhausted/disabled/missing, randomly switch
+// to another non-exhausted workbuddy candidate. Non-workbuddy candidates are
+// always deferred so the built-in scheduler handles them.
 package main
 
 import (
 	"encoding/json"
-	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+// Legacy config values kept for configure() compatibility; pick always uses
+// panel active-auth selection now (not credit-max ranking).
 const (
 	schedulerModeOff     = "off"
 	schedulerModeCredits = "credits"
-	schedulerModeExpiry  = "expiry"
 )
 
 var (
@@ -45,30 +45,39 @@ func loadedSchedulerMode() string {
 	return schedulerMode
 }
 
-// handleSchedulerPick selects an enabled WorkBuddy auth candidate. Other
-// providers are always deferred to the built-in scheduler.
+// handleSchedulerPick selects a workbuddy auth candidate based on the
+// panel-selected active account. Non-workbuddy candidates are always deferred
+// (Handled: false) so the built-in scheduler handles them.
 //
 // scheduler_mode:
-//   - "off"     → defer everything to the built-in scheduler.
-//   - "credits" → use the panel-selected account, with its existing sticky
-//     fallback behavior.
-//   - "expiry"  → use fresh cached package deadlines without changing the
-//     panel selection.
+//   - "off"     → plugin does NOT handle routing; defer everything to built-in.
+//   - "credits" → plugin picks via panel-selected active account (sticky, with
+//     fallback when that account becomes exhausted/disabled).
+//
+// Default is off (see schedulerMode init). Users opting into the plugin's
+// routing should set scheduler_mode: credits in plugin config.
 func handleSchedulerPick(raw []byte) ([]byte, error) {
 	var req pluginapi.SchedulerPickRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
 
-	mode := loadedSchedulerMode()
-	if mode != schedulerModeCredits && mode != schedulerModeExpiry {
+	// v0.6.31: actually honor the scheduler_mode toggle. Previously the config
+	// was parsed but never read here, so "off" silently behaved like "credits".
+	if loadedSchedulerMode() != schedulerModeCredits {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 
-	// Collect enabled WorkBuddy candidates only.
+	// Collect workbuddy candidates only.
 	var wbCandidates []pluginapi.SchedulerAuthCandidate
 	for _, c := range req.Candidates {
-		if c.Provider != providerName || candidateDisabled(c) {
+		if c.Provider != providerName {
+			continue
+		}
+		if candidateDisabled(c) {
+			continue
+		}
+		if !currentModelRuntime().snapshotForAuthID(c.ID).State.executable() {
 			continue
 		}
 		wbCandidates = append(wbCandidates, c)
@@ -77,22 +86,17 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 
-	var picked string
-	if mode == schedulerModeExpiry {
-		picked = pickExpiryAuth(wbCandidates, time.Now())
-	} else {
-		// Preserve credits mode's panel-sticky behavior exactly.
-		cands := make([]activeAuthCandidate, 0, len(wbCandidates))
-		for _, c := range wbCandidates {
-			_, exhausted := cachedCreditsScore(c.ID)
-			cands = append(cands, activeAuthCandidate{
-				ID:        c.ID,
-				Disabled:  false, // already filtered
-				Exhausted: exhausted,
-			})
-		}
-		picked = pickActiveAuth(cands)
+	// Build thin view for active-auth picker.
+	cands := make([]activeAuthCandidate, 0, len(wbCandidates))
+	for _, c := range wbCandidates {
+		_, exhausted := cachedCreditsScore(c.ID)
+		cands = append(cands, activeAuthCandidate{
+			ID:        c.ID,
+			Disabled:  false, // already filtered
+			Exhausted: exhausted,
+		})
 	}
+	picked := pickActiveAuth(cands)
 	if picked == "" {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
@@ -100,96 +104,6 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 		AuthID:  picked,
 		Handled: true,
 	})
-}
-
-type expiryCandidate struct {
-	id        string
-	deadline  int64
-	known     bool
-	exhausted bool
-}
-
-// pickExpiryAuth ranks only cached data. Fresh, known package deadlines sort
-// before unknown data, then by earliest deadline and finally by auth ID. It
-// deliberately does not call setActiveAuthID: expiry routing is independent
-// from the account selected in the panel.
-func pickExpiryAuth(candidates []pluginapi.SchedulerAuthCandidate, now time.Time) string {
-	ranked := make([]expiryCandidate, 0, len(candidates))
-	for _, candidate := range candidates {
-		ranked = append(ranked, cachedExpiryCandidate(candidate.ID, now))
-	}
-
-	available := ranked[:0]
-	for _, candidate := range ranked {
-		if !candidate.exhausted {
-			available = append(available, candidate)
-		}
-	}
-	if len(available) == 0 {
-		// Preserve credits mode's conservative all-exhausted fallback: keep a
-		// live panel selection, otherwise use the host's first candidate.
-		current := getActiveAuthID()
-		for _, candidate := range ranked {
-			if candidate.id == current {
-				return current
-			}
-		}
-		if len(ranked) > 0 {
-			return ranked[0].id
-		}
-		return ""
-	}
-
-	sort.Slice(available, func(i, j int) bool {
-		left, right := available[i], available[j]
-		if left.known != right.known {
-			return left.known
-		}
-		if left.known && left.deadline != right.deadline {
-			return left.deadline < right.deadline
-		}
-		return left.id < right.id
-	})
-	return available[0].id
-}
-
-func cachedExpiryCandidate(authID string, now time.Time) expiryCandidate {
-	candidate := expiryCandidate{id: authID}
-	value, ok := accountCache.Load(authID)
-	if !ok {
-		return candidate
-	}
-	entry, ok := value.(*accountCacheEntry)
-	if !ok || entry == nil || entry.credits == nil {
-		return candidate
-	}
-	credits := entry.credits
-	age := now.Sub(credits.creditsFetched)
-	if credits.creditsFetched.IsZero() || age < 0 || age > accountCacheTTL {
-		return candidate
-	}
-	candidate.exhausted = isCreditsExhausted(credits)
-	if candidate.exhausted {
-		return candidate
-	}
-
-	nowMillis := now.UnixMilli()
-	for _, pkg := range credits.Packages {
-		if pkg.Status != 0 || pkg.Remain <= 0 {
-			continue
-		}
-		if pkg.DeductionStartTime > nowMillis {
-			continue
-		}
-		if pkg.DeductionEndTime <= nowMillis {
-			continue
-		}
-		if !candidate.known || pkg.DeductionEndTime < candidate.deadline {
-			candidate.known = true
-			candidate.deadline = pkg.DeductionEndTime
-		}
-	}
-	return candidate
 }
 
 // candidateDisabled reports host-disabled auth from Status/metadata.

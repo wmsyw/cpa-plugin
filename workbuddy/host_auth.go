@@ -24,6 +24,11 @@ type rpcHostAuthGetResponse struct {
 	JSON      json.RawMessage `json:"json"`
 }
 
+func isWorkbuddyAuthListName(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return name == authFileName || strings.HasPrefix(name, providerName+"-")
+}
+
 // hostAuthList returns all workbuddy credentials known to the host.
 func hostAuthList() ([]pluginapi.HostAuthFileEntry, error) {
 	raw, err := hostCall(pluginabi.MethodHostAuthList, nil)
@@ -38,32 +43,18 @@ func hostAuthList() ([]pluginapi.HostAuthFileEntry, error) {
 	if err := json.Unmarshal(env.Result, &resp); err != nil {
 		return nil, err
 	}
-	// The host manager can temporarily retain two runtime records for one
-	// physical file after a credential is refreshed/migrated. Those records
-	// share auth_index and path but may have different IDs, so the dashboard
-	// must collapse them before fetching account details.
+	// Fresh slice — resp.Files[:0] would alias the RPC response's backing
+	// array (P1-3: fragile pattern, safe today but could break if resp is
+	// ever cached/reused).
+	//
+	// Filter by the canonical legacy filename or the provider-specific prefix,
+	// NOT by Type/Provider: many existing auth files don't carry those fields.
+	// Filename is the reliable cross-version discriminator.
 	out := make([]pluginapi.HostAuthFileEntry, 0, len(resp.Files))
-	seen := make(map[string]int, len(resp.Files))
-	prefix := providerName + "-"
 	for _, f := range resp.Files {
-		if !strings.HasPrefix(strings.ToLower(f.Name), prefix) {
-			continue
+		if isWorkbuddyAuthListName(f.Name) {
+			out = append(out, f)
 		}
-		key := strings.TrimSpace(f.AuthIndex)
-		if key == "" {
-			key = strings.ToLower(strings.TrimSpace(f.Path))
-		}
-		if key == "" {
-			key = strings.ToLower(strings.TrimSpace(f.Name))
-		}
-		if i, exists := seen[key]; exists {
-			if strings.EqualFold(strings.TrimSpace(f.ID), strings.TrimSpace(f.Name)) {
-				out[i] = f
-			}
-			continue
-		}
-		seen[key] = len(out)
-		out = append(out, f)
 	}
 	return out, nil
 }

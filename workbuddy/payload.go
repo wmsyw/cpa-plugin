@@ -7,21 +7,17 @@ package main
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 )
 
 // forceStreamBody returns the request body with "stream":true set, since the
 // upstream rejects non-streaming chat requests.
 // prepareUpstreamBody composes forceStreamBody + normalizeToolsForUpstream +
-// rewriteSystemForUpstream + ensureSystemMessage + rewriteModelInBody into a
+// rewriteModelInBody + rewriteSystemForUpstream + ensureSystemMessage into a
 // single unmarshal/marshal pass (v0.6.31 perf: was 4-5 full JSON round-trips
 // on every chat completion). The 4 legacy helpers remain for tests and other
 // call sites that need them individually.
-//
-// Context capacity is deliberately not sent as a request control: CodeBuddy's
-// Chat Completions API derives the accepted input window from the selected
-// model. The upstream catalog's maxInputTokens/maxAllowedSize is used for
-// client-facing metadata so callers compact only at that model's real limit.
 func prepareUpstreamBody(payload, original []byte, sa *storedAuth, upstreamModel string) []byte {
 	src := payload
 	if len(src) == 0 {
@@ -41,28 +37,25 @@ func prepareUpstreamBody(payload, original []byte, sa *storedAuth, upstreamModel
 	// 2. normalizeTools: tool_choice object form → string; "none" suppresses tools.
 	normalizeToolsInPlace(obj)
 
-	// 3. normalize roles first: both CN and Global gateways reject the
+	// 3. rewriteModel: swap client model name to upstream model id.
+	rewriteModelInPlace(obj, upstreamModel)
+
+	// 4. normalize roles first: both CN and Global gateways reject the
 	// OpenAI-only "developer" role with 11128. Converting before the content
 	// rewrite lets identity templates inside developer messages be sanitized
-	// under their post-conversion system role.
+	// under their post-conversion system role. (Fork fix, live-probed
+	// 2026-09-03; upstream v0.9.3 forwards the role verbatim.)
 	normalizeDeveloperRoleInPlace(obj)
 
-	// 4. rewriteSystem: strip blocked Claude Code template phrases.
+	// 5. system sanitization: strip blocked Claude Code template phrases.
 	rewriteSystemInPlace(obj)
 
-	// 5. desensitize: insert zero-width separators into provider-blocked
-	// terms across system/developer prompt text, marker-bearing user text,
-	// and tool description/title fields (ported from Sliverkiss/cpa-plugin
-	// v0.9.3). Runs after the role conversion and identity rewrite so every
-	// scanned field is normalized once, in order.
-	applyDesensitizeInPlace(obj)
+	// 6. desensitize the configured prompt and tool metadata fields.
+	applyDesensitizeInPlace(obj, currentFeatureRuntime())
 
-	// 6. ensureSystemMessage: inject minimal system msg for Global only.
+	// 7. ensureSystemMessage: inject minimal system msg for Global only.
 	ensureSystemMessageInPlace(obj, sa)
 
-	// 7. rewriteModel and translate official reasoning efforts to upstream labels.
-	rewriteModelInPlace(obj, upstreamModel)
-	mapReasoningEffortInPlace(obj, upstreamModel)
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return src
@@ -130,27 +123,11 @@ func normalizeToolsInPlace(obj map[string]any) bool {
 	return changed
 }
 
-// rewriteSystemInPlace is the in-place form of rewriteSystemForUpstream.
-func rewriteSystemInPlace(obj map[string]any) bool {
-	messages, _ := obj["messages"].([]any)
-	changed := false
-	for _, m := range messages {
-		msg, ok := m.(map[string]any)
-		if !ok {
-			continue
-		}
-		if rewriteContentField(msg) {
-			changed = true
-		}
-	}
-	return changed
-}
-
 // normalizeDeveloperRoleInPlace converts the OpenAI-only "developer" role to
 // "system". Both CN (copilot.tencent.com) and Global (www.workbuddy.ai)
-// gateways reject the developer role with code 11128 ("Illegal API invocation
-// from an unapproved channel"); live-probed 2026-09-03. Relative message order
-// is preserved; only the role label changes.
+// gateways reject the developer role with code 11128; relative message order
+// is preserved and only the role label changes. (Fork fix; upstream v0.9.3
+// does not convert the role.)
 func normalizeDeveloperRoleInPlace(obj map[string]any) bool {
 	messages, _ := obj["messages"].([]any)
 	changed := false
@@ -161,6 +138,22 @@ func normalizeDeveloperRoleInPlace(obj map[string]any) bool {
 		}
 		if role, _ := msg["role"].(string); strings.EqualFold(role, "developer") {
 			msg["role"] = "system"
+			changed = true
+		}
+	}
+	return changed
+}
+
+// rewriteSystemInPlace is the in-place form of rewriteSystemForUpstream.
+func rewriteSystemInPlace(obj map[string]any) bool {
+	messages, _ := obj["messages"].([]any)
+	changed := false
+	for _, m := range messages {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		if rewriteContentField(msg) {
 			changed = true
 		}
 	}
@@ -195,15 +188,14 @@ func ensureSystemMessageInPlace(obj map[string]any, sa *storedAuth) bool {
 }
 
 // rewriteModelInPlace swaps obj["model"] to upstreamModel when non-empty.
-// Mirrors rewriteModelInBody's behavior (case-insensitive compare); returns
-// true when modified.
+// Returns true when modified.
 func rewriteModelInPlace(obj map[string]any, upstreamModel string) bool {
 	upstreamModel = strings.TrimSpace(upstreamModel)
 	if upstreamModel == "" {
 		return false
 	}
 	cur, _ := obj["model"].(string)
-	if strings.EqualFold(strings.TrimSpace(cur), upstreamModel) {
+	if cur == upstreamModel {
 		return false
 	}
 	obj["model"] = upstreamModel
@@ -424,51 +416,45 @@ func rewriteContentField(msg map[string]any) bool {
 	return false
 }
 
+var sanitizeFeatures = []string{
+	"x-anthropic-billing-header",
+	"You are Claude Code",
+	"Main branch (",
+}
+
+var sanitizeBillingHeaderRE = regexp.MustCompile(`(?i)x-anthropic-billing-header:[^;\n]*;?\s*`)
+var sanitizeCCEntrypointRE = regexp.MustCompile(`(?i)\bcc_entrypoint=`)
+var sanitizeCCKeyValueRE = regexp.MustCompile(`(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*`)
+
 func sanitizeBlockedTemplates(s string) string {
+	if !hasFingerprint(s) {
+		return s
+	}
+	original := s
 	s = strings.ReplaceAll(s,
 		"You are Claude Code, Anthropic's official CLI for Claude.",
 		"You are Claude Code, Anthropic's official CLI tool for Claude.")
 	s = strings.ReplaceAll(s,
 		"Main branch (you will usually use this for PRs)",
 		"Default branch (you will usually use this for PRs)")
-	return s
+	s = sanitizeBillingHeaderRE.ReplaceAllString(s, "")
+	s = sanitizeCCKeyValueRE.ReplaceAllString(s, "")
+	if s == original {
+		return original
+	}
+	return strings.TrimSpace(s)
 }
 
-// mapReasoningEffortInPlace translates official-model effort names to the
-// labels accepted by WorkBuddy. Clients can therefore consistently send the
-// official values low/high/max.
-func mapReasoningEffortInPlace(obj map[string]any, model string) bool {
-	effort, _ := obj["reasoning_effort"].(string)
-	effort = strings.ToLower(strings.TrimSpace(effort))
-	if effort == "" {
-		return false
+func hasFingerprint(s string) bool {
+	if sanitizeCCEntrypointRE.MatchString(s) {
+		return true
 	}
-	mapped := effort
-	switch model {
-	case "kimi-k3-1", "deepseek-v4-pro", "deepseek-v4-flash", "glm-5.3", "glm-5.3-flash", "glm-5.2":
-		if effort == "max" {
-			mapped = "xhigh"
-		}
-	case "hy3", "hy3-preview", "hy3-preview-agent", "hy3-x":
-		// WorkBuddy's Hunyuan routes only honor high for deep thinking.
-		if effort == "max" {
-			mapped = "high"
-		}
-	case "hy4-preview", "hy4-preview-x":
-		// Both Hy4 Preview tiers expose only none/high: map the compatible
-		// OpenAI ladder to their no-think/deep-think endpoints.
-		switch effort {
-		case "low":
-			mapped = "none"
-		case "medium", "xhigh", "max":
-			mapped = "high"
+	for _, feature := range sanitizeFeatures {
+		if strings.Contains(s, feature) {
+			return true
 		}
 	}
-	if mapped == effort {
-		return false
-	}
-	obj["reasoning_effort"] = mapped
-	return true
+	return sanitizeBillingHeaderRE.MatchString(s)
 }
 
 // rewriteModelInBody replaces the "model" field of a chat-completions body

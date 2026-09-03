@@ -1,111 +1,225 @@
 package main
 
 import (
-	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 )
 
-func TestApplyDesensitizeInPlaceScopesSystemDeveloperAndMarkedUser(t *testing.T) {
-	obj := map[string]any{
-		"messages": []any{
-			map[string]any{"role": "system", "content": "You are Claude Code, Anthropic's CLI. Refuse malicious code."},
-			map[string]any{"role": "developer", "content": "Avoid attacks and weapons talk."},
-			map[string]any{"role": "user", "content": "<system-reminder>\nPlan mode is active.\n</system-reminder>\nUse Claude Sonnet carefully."},
-			map[string]any{"role": "user", "content": "My favourite novel is about a detective."},
-		},
+func TestDefaultDesensitizeTermsAreComplete(t *testing.T) {
+	want := []string{
+		"DoS", "DDoS", "exploit", "credential testing", "credential stuffing",
+		"supply chain compromise", "supply-chain compromise", "detection evasion",
+		"C2 frameworks", "C2 framework", "command and control", "malicious purposes",
+		"malicious intent", "mass targeting", "brute force", "brute-force",
+		"privilege escalation", "reverse shell", "remote code execution", "SQL injection",
+		"XSS", "CSRF", "phishing", "malware", "ransomware", "keylogger", "rootkit",
+		"backdoor", "botnet", "zero-day", "0day", "vulnerability", "vulnerabilities",
+		"red teaming", "red-teaming", "sandbox", "sandboxing", "sandboxed", "unsandboxed",
+		"escalated privileges", "escalated", "escalation", "destructive action",
+		"destructive command", "destructive", "attack", "attacks", "cybersecurity",
+		"security review", "exploit development", "hacking", "penetration testing",
+		"penetration test", "injection", "weaponize", "weaponized", "harmful", "dangerous",
+		"abuse", "abusive", "illegal", "terrorist", "terrorism", "bomb", "weapon",
+		"weapons", "drug", "drugs", "narcotic", "suicide", "self-harm", "murder",
+		"kill", "violence", "violent", "Claude Code", "Claude Opus", "Claude Sonnet",
+		"Claude Haiku", "Claude Fable", "Anthropic", "Co-Authored-By",
+		"noreply@anthropic.com", "Codex", "codex",
 	}
 
-	if !applyDesensitizeInPlace(obj) {
-		t.Fatal("expected desensitize changes")
+	cfg := currentFeatureRuntime()
+	if cfg == nil {
+		t.Fatal("feature runtime is nil")
 	}
-	messages := obj["messages"].([]any)
-	if got := messages[0].(map[string]any)["content"].(string); strings.ContainsAny(got, "") || !strings.Contains(got, "C\u200blaude Code") {
-		t.Fatalf("system content not desensitized: %q", got)
+	if !sameStrings(cfg.desensitizeTerms, want) {
+		t.Fatalf("default terms = %#v, want %#v", cfg.desensitizeTerms, want)
 	}
-	if got := messages[1].(map[string]any)["content"].(string); !strings.Contains(got, "a\u200bttacks") {
-		t.Fatalf("developer content not desensitized: %q", got)
+	if !cfg.desensitizeEnabled {
+		t.Fatal("desensitize must default on (fork deviation)")
 	}
-	if got := messages[2].(map[string]any)["content"].(string); !strings.Contains(got, "C\u200blaude Sonnet") {
-		t.Fatalf("marked user content not desensitized: %q", got)
+	if cfg.desensitizeSource != "default" {
+		t.Fatalf("source = %q, want default", cfg.desensitizeSource)
 	}
-	if got := messages[3].(map[string]any)["content"].(string); got != "My favourite novel is about a detective." {
-		t.Fatalf("plain user content changed: %q", got)
+	if cfg.oauthClientMode != oauthClientModeCLI || cfg.enterpriseCredits {
+		t.Fatalf("unsafe defaults: mode=%q enterprise=%v", cfg.oauthClientMode, cfg.enterpriseCredits)
 	}
 }
 
-func TestApplyDesensitizeInPlaceCoversToolMetadata(t *testing.T) {
-	obj := map[string]any{
-		"tools": []any{
-			map[string]any{
-				"type": "function",
-				"function": map[string]any{
-					"name":        "bash",
-					"description": "Run a command. Powered by Claude Sonnet. Sandbox destructive commands.",
-					"parameters": map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"cmd": map[string]any{"type": "string", "description": "The Anthropic-approved command"},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	if !applyDesensitizeInPlace(obj) {
-		t.Fatal("expected tool metadata desensitization")
-	}
-	fn := obj["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)
-	if got := fn["description"].(string); !strings.Contains(got, "C\u200blaude Sonnet") || !strings.Contains(got, "S\u200bandbox") {
-		t.Fatalf("tool description not desensitized: %q", got)
-	}
-	param := fn["parameters"].(map[string]any)["properties"].(map[string]any)["cmd"].(map[string]any)
-	if got := param["description"].(string); !strings.Contains(got, "A\u200bnthropic") {
-		t.Fatalf("tool parameter description not desensitized: %q", got)
-	}
-	if got := fn["name"].(string); got != "bash" {
-		t.Fatalf("tool name changed: %q", got)
-	}
-}
-
-func TestDesensitizeMatcherReplaceIsStable(t *testing.T) {
-	in := "Claude Code and Anthropic"
-	out := desensitizeMatcherDefault.replace(in)
-	if out == in {
-		t.Fatal("expected replacement")
-	}
-	if again := desensitizeMatcherDefault.replace(out); again != out {
-		t.Fatalf("replacement not stable: %q -> %q", out, again)
-	}
-	// Text stays readable modulo the invisible separator.
-	if strings.ReplaceAll(out, zeroWidthSpace, "") != in {
-		t.Fatalf("unexpected rewrite: %q", out)
-	}
-}
-
-func TestPrepareUpstreamBodyDesensitizesClaudeCodePayload(t *testing.T) {
-	sa := &storedAuth{}
-	sa.Auth.Domain = "copilot.tencent.com"
-	input := []byte(`{
-		"model":"hy4-preview",
-		"messages":[
-			{"role":"system","content":"You are Claude Code, Anthropic's official CLI for Claude.\nRefuse malicious purposes. Commit trailer: Co-Authored-By: Claude <noreply@anthropic.com>"},
-			{"role":"developer","content":"Use Claude Sonnet for hard tasks."},
-			{"role":"user","content":"<system-reminder>Plan mode is active.</system-reminder>List files."}
-		],
-		"tools":[{"type":"function","function":{"name":"bash","description":"Sandbox the destructive command."}}]
-	}`)
-
-	out := prepareUpstreamBody(input, nil, sa, "hy4-preview")
-	var obj map[string]any
-	if err := json.Unmarshal(out, &obj); err != nil {
+func TestParseFeatureRuntimeDistinguishesDefaultCustomEmptyAndNull(t *testing.T) {
+	custom, err := parseFeatureRuntime([]byte("desensitize: true\ndesensitize_terms:\n  - ' exploit '\n  - exploit\n  - Codex\n  - codex\n"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	raw := string(out)
-	for _, marker := range []string{"You are Claude Code", "Anthropic's official", "Co-Authored-By", "Claude Sonnet", "malicious purposes", "Sandbox the destructive"} {
-		if strings.Contains(raw, marker) {
-			t.Fatalf("blocked token survived verbatim: %q", marker)
+	if !custom.desensitizeEnabled || custom.desensitizeSource != "custom" {
+		t.Fatalf("custom config = %#v", custom)
+	}
+	want := []string{"exploit", "Codex", "codex"}
+	if !sameStrings(custom.desensitizeTerms, want) {
+		t.Fatalf("custom terms = %#v, want %#v", custom.desensitizeTerms, want)
+	}
+
+	empty, err := parseFeatureRuntime([]byte("desensitize: true\ndesensitize_terms: []\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty.desensitizeSource != "custom" || len(empty.desensitizeTerms) != 0 {
+		t.Fatalf("empty custom terms = %#v", empty)
+	}
+
+	for _, raw := range [][]byte{nil, []byte("desensitize_terms: null\n")} {
+		defaults, err := parseFeatureRuntime(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(defaults.desensitizeTerms) != 85 || defaults.desensitizeSource != "default" {
+			t.Fatalf("defaults = %#v", defaults)
+		}
+	}
+}
+
+func TestParseFeatureRuntimeRejectsUnsafeTermsAndModes(t *testing.T) {
+	for _, raw := range []string{
+		"desensitize_terms: [x]\n",
+		"desensitize_terms: ['a​b']\n",
+		"oauth_client_mode: browser\n",
+	} {
+		if _, err := parseFeatureRuntime([]byte(raw)); err == nil {
+			t.Fatalf("parseFeatureRuntime(%q) succeeded", raw)
+		}
+	}
+}
+
+func TestDesensitizeMatcherIsLiteralCaseInsensitiveConvergentAndIdempotent(t *testing.T) {
+	cfg, err := parseFeatureRuntime([]byte("desensitize: true\ndesensitize_terms: [exploit, DDoS, DoS, kill, attack, noreply@anthropic.com, Anthropic, abc, bcd, 'a+b', Codex, codex]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		in   string
+		want string
+	}{
+		{"DDoS", "D​D​oS"},
+		{"EXPLOIT-free skill", "E​XPLOIT-free sk​ill"},
+		{"attacker", "a​ttacker"},
+		{"noreply@anthropic.com", "n​oreply@a​nthropic.com"},
+		{"abcd", "a​b​cd"},
+		{"a+b", "a​+b"},
+		{"Codex codex", "C​odex c​odex"},
+		{"a​ttack", "a​ttack"},
+	} {
+		got := cfg.matcher.replace(tt.in)
+		if got != tt.want {
+			t.Errorf("replace(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+		if again := cfg.matcher.replace(got); again != got {
+			t.Errorf("replace is not idempotent: %q -> %q", got, again)
+		}
+	}
+	if strings.Contains(cfg.matcher.replace("DDoS"), "DoS") {
+		t.Fatal("nested term still matches after convergence")
+	}
+}
+
+func TestFeatureRuntimeSnapshotTermsCannotBeMutatedByCallers(t *testing.T) {
+	before := currentFeatureRuntime()
+	if len(before.desensitizeTerms) == 0 {
+		t.Fatal("missing default terms")
+	}
+	original := before.desensitizeTerms[0]
+	before.desensitizeTerms[0] = "mutated"
+	if got := currentFeatureRuntime().desensitizeTerms[0]; got != original {
+		t.Fatalf("mutating caller snapshot changed runtime term to %q", got)
+	}
+}
+
+func TestConfigureFeatureRuntimeKeepsPreviousSnapshotOnInvalidTerms(t *testing.T) {
+	old := featureRuntime.Load()
+	t.Cleanup(func() { featureRuntime.Store(old) })
+
+	if err := configure(mustJSON(map[string]any{
+		"config_yaml": []byte("desensitize: true\ndesensitize_terms: [attack]\nusage_report_url: http://127.0.0.1:1\n"),
+	})); err != nil {
+		t.Fatal(err)
+	}
+	before := currentFeatureRuntime()
+	if !before.desensitizeEnabled || !sameStrings(before.desensitizeTerms, []string{"attack"}) {
+		t.Fatalf("configured runtime = %#v", before)
+	}
+
+	if err := configure(mustJSON(map[string]any{
+		"config_yaml": []byte("desensitize_terms: [x]\nusage_report_url: http://127.0.0.1:1\n"),
+	})); err == nil {
+		t.Fatal("invalid desensitize terms were accepted")
+	}
+	after := currentFeatureRuntime()
+	if after.desensitizeEnabled != before.desensitizeEnabled || !sameStrings(after.desensitizeTerms, before.desensitizeTerms) {
+		t.Fatalf("invalid config replaced runtime: before=%#v after=%#v", before, after)
+	}
+}
+
+func TestConfigureInvalidProxyFailsClosedEvenWhenFeatureValidationFails(t *testing.T) {
+	oldProxy := currentProxyState()
+	oldFeatures := featureRuntime.Load()
+	t.Cleanup(func() {
+		proxyState.Store(oldProxy)
+		featureRuntime.Store(oldFeatures)
+	})
+	proxyState.Store(&proxyRoutingState{mode: proxyModeInherit})
+
+	err := configure(mustJSON(map[string]any{
+		"config_yaml": []byte("desensitize_terms: [x]\nproxy-url: [not-a-string]\n"),
+	}))
+	if err == nil {
+		t.Fatal("invalid configuration was accepted")
+	}
+	if got := currentProxyState().mode; got != proxyModeBlocked {
+		t.Fatalf("proxy mode = %v, want blocked", got)
+	}
+}
+
+func TestFeatureRuntimeSnapshotsStayIndependentDuringConcurrentReads(t *testing.T) {
+	old := featureRuntime.Load()
+	t.Cleanup(func() { featureRuntime.Store(old) })
+
+	first, err := parseFeatureRuntime([]byte("desensitize_terms: [attack]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := parseFeatureRuntime([]byte("desensitize_terms: [exploit]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	featureRuntime.Store(first)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 1000; i++ {
+			featureRuntime.Store(second)
+			featureRuntime.Store(first)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 1000; i++ {
+			cfg := currentFeatureRuntime()
+			if len(cfg.desensitizeTerms) != 1 {
+				t.Errorf("terms = %#v", cfg.desensitizeTerms)
+				return
+			}
+			cfg.desensitizeTerms[0] = "caller mutation"
+		}
+	}()
+	close(start)
+	wg.Wait()
+
+	for _, cfg := range []*featureRuntimeConfig{first, second} {
+		if cfg.desensitizeTerms[0] == "caller mutation" {
+			t.Fatalf("runtime snapshot was mutated: %#v", cfg)
 		}
 	}
 }

@@ -1,23 +1,21 @@
-// desensitize.go inserts a zero-width space (U+200B) after the first rune of
-// every provider-blocked term in the fields the upstream channel filter scans,
-// so the gateway's exact-match check (code 11128) cannot byte-match them.
-//
-// Ported from the reference implementation in Sliverkiss/cpa-plugin v0.9.3
-// (workbuddy/desensitize.go), simplified for this fork: the default term list
-// is always enabled and the YAML config surface is intentionally omitted.
-// Live-verified against the CN gateway on 2026-09-03: a Claude-Code-shaped
-// payload with raw tokens returns 11128; the same payload with U+200B
-// separators returns 200.
 package main
 
 import (
+	"errors"
 	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"unicode/utf8"
+
+	"gopkg.in/yaml.v3"
 )
 
-const zeroWidthSpace = "​"
+const (
+	zeroWidthSpace           = "​"
+	oauthClientModeCLI       = "cli"
+	oauthClientModeWorkBuddy = "workbuddy"
+)
 
 var defaultDesensitizeTerms = []string{
 	"DoS", "DDoS", "exploit", "credential testing", "credential stuffing",
@@ -43,12 +41,154 @@ type desensitizeMatcher struct {
 	expression *regexp.Regexp
 }
 
-func mustCompileDesensitizeMatcher(terms []string) *desensitizeMatcher {
-	matcher, err := compileDesensitizeMatcher(terms)
+type featureRuntimeConfig struct {
+	desensitizeEnabled bool
+	desensitizeTerms   []string
+	desensitizeSource  string
+	matcher            *desensitizeMatcher
+	oauthClientMode    string
+	enterpriseCredits  bool
+	configuredModels   []string
+}
+
+var featureRuntime atomic.Pointer[featureRuntimeConfig]
+
+func init() {
+	cfg, err := parseFeatureRuntime(nil)
 	if err != nil {
 		panic(err)
 	}
-	return matcher
+	featureRuntime.Store(cfg)
+}
+
+func currentFeatureRuntime() *featureRuntimeConfig {
+	cfg := featureRuntime.Load()
+	if cfg == nil {
+		return nil
+	}
+	snapshot := *cfg
+	snapshot.desensitizeTerms = append([]string(nil), cfg.desensitizeTerms...)
+	snapshot.configuredModels = append([]string(nil), cfg.configuredModels...)
+	return &snapshot
+}
+
+type featureConfigYAML struct {
+	Desensitize       *bool     `yaml:"desensitize"`
+	DesensitizeTerms  *[]string `yaml:"desensitize_terms"`
+	OAuthClientMode   string    `yaml:"oauth_client_mode"`
+	EnterpriseCredits *bool     `yaml:"enterprise_credits"`
+	Models            yaml.Node `yaml:"models"`
+}
+
+func parseFeatureRuntime(raw []byte) (*featureRuntimeConfig, error) {
+	var doc featureConfigYAML
+	if strings.TrimSpace(string(raw)) != "" {
+		if _, err := parseValidatedConfigRoot(raw); err != nil {
+			return nil, err
+		}
+		if err := yaml.Unmarshal(raw, &doc); err != nil {
+			return nil, errors.New("invalid config_yaml")
+		}
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(doc.OAuthClientMode))
+	if mode == "" {
+		mode = oauthClientModeCLI
+	}
+	if mode != oauthClientModeCLI && mode != oauthClientModeWorkBuddy {
+		return nil, errors.New("oauth_client_mode must be cli or workbuddy")
+	}
+
+	terms, source, err := normalizedDesensitizeTerms(doc.DesensitizeTerms)
+	if err != nil {
+		return nil, err
+	}
+	matcher, err := compileDesensitizeMatcher(terms)
+	if err != nil {
+		return nil, err
+	}
+	models, err := normalizedConfiguredModels(doc.Models)
+	if err != nil {
+		return nil, err
+	}
+	return &featureRuntimeConfig{
+		desensitizeEnabled: doc.Desensitize == nil || *doc.Desensitize,
+		desensitizeTerms:   terms,
+		desensitizeSource:  source,
+		matcher:            matcher,
+		oauthClientMode:    mode,
+		enterpriseCredits:  doc.EnterpriseCredits != nil && *doc.EnterpriseCredits,
+		configuredModels:   models,
+	}, nil
+}
+
+func normalizedConfiguredModels(node yaml.Node) ([]string, error) {
+	if node.Kind == 0 {
+		return nil, nil
+	}
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!null" && node.Style&yaml.TaggedStyle == 0 {
+		return nil, nil
+	}
+	if node.Kind != yaml.SequenceNode || node.Tag != "!!seq" || node.Style&yaml.TaggedStyle != 0 {
+		return nil, errors.New("models must be an array of strings")
+	}
+	models := make([]string, len(node.Content))
+	seen := make(map[string]struct{}, len(node.Content))
+	for i, entry := range node.Content {
+		if entry.Kind != yaml.ScalarNode || entry.Tag != "!!str" || entry.Style&yaml.TaggedStyle != 0 {
+			return nil, errors.New("models entries must be strings")
+		}
+		if strings.IndexFunc(entry.Value, func(r rune) bool {
+			return r == '\r' || r == '\n' || r == 0x85 || r == 0x2028 || r == 0x2029
+		}) >= 0 {
+			return nil, errors.New("models entries must be single-line strings")
+		}
+		id := strings.TrimSpace(entry.Value)
+		if id == "" {
+			return nil, errors.New("models entries must not be empty")
+		}
+		if len(id) > maxDiscoveredModelIDBytes {
+			return nil, errors.New("models entry exceeds maximum ID length")
+		}
+		if _, exists := seen[id]; exists {
+			return nil, errors.New("models entries must not be duplicated")
+		}
+		seen[id] = struct{}{}
+		models[i] = id
+	}
+	return models, nil
+}
+
+func normalizedDesensitizeTerms(configured *[]string) ([]string, string, error) {
+	source := "custom"
+	input := []string(nil)
+	if configured == nil {
+		source = "default"
+		input = defaultDesensitizeTerms
+	} else {
+		input = *configured
+	}
+
+	terms := make([]string, 0, len(input))
+	seen := make(map[string]struct{}, len(input))
+	for _, raw := range input {
+		term := strings.TrimSpace(raw)
+		if term == "" {
+			continue
+		}
+		if _, exists := seen[term]; exists {
+			continue
+		}
+		if utf8.RuneCountInString(term) < 2 {
+			return nil, "", errors.New("desensitize_terms entries must contain at least two Unicode runes")
+		}
+		if strings.Contains(term, zeroWidthSpace) {
+			return nil, "", errors.New("desensitize_terms entries must not contain U+200B")
+		}
+		seen[term] = struct{}{}
+		terms = append(terms, term)
+	}
+	return terms, source, nil
 }
 
 func compileDesensitizeMatcher(terms []string) (*desensitizeMatcher, error) {
@@ -66,10 +206,9 @@ func compileDesensitizeMatcher(terms []string) (*desensitizeMatcher, error) {
 				break
 			}
 		}
-		if duplicate {
-			continue
+		if !duplicate {
+			alternatives = append(alternatives, term)
 		}
-		alternatives = append(alternatives, term)
 	}
 	if len(alternatives) == 0 {
 		return &desensitizeMatcher{}, nil
@@ -85,9 +224,6 @@ func compileDesensitizeMatcher(terms []string) (*desensitizeMatcher, error) {
 	return &desensitizeMatcher{expression: expression}, nil
 }
 
-// desensitizeMatcherDefault is built once from the immutable default term list.
-var desensitizeMatcherDefault = mustCompileDesensitizeMatcher(defaultDesensitizeTerms)
-
 var desensitizeUserMarkers = []string{
 	"# AGENTS.md instructions",
 	"<environment_context>",
@@ -98,26 +234,28 @@ var desensitizeUserMarkers = []string{
 	"# claudeMd",
 }
 
-// applyDesensitizeInPlace changes only the prompt and tool metadata fields the
-// original plugin's desensitization scope allows: system/developer prompt text,
-// user text that carries client-injected markers, and tool description/title
-// strings (recursively, so tool parameter descriptions are covered).
-func applyDesensitizeInPlace(obj map[string]any) bool {
+// applyDesensitizeInPlace changes only the prompt and tool metadata fields
+// allowed by the configured desensitization scope.
+func applyDesensitizeInPlace(obj map[string]any, cfg *featureRuntimeConfig) bool {
+	if cfg == nil || !cfg.desensitizeEnabled || cfg.matcher == nil {
+		return false
+	}
+
 	changed := false
 	if messages, ok := obj["messages"].([]any); ok {
 		for _, raw := range messages {
-			if msg, ok := raw.(map[string]any); ok && desensitizeMessageInPlace(msg, desensitizeMatcherDefault) {
+			if msg, ok := raw.(map[string]any); ok && desensitizeMessageInPlace(msg, cfg) {
 				changed = true
 			}
 		}
 	}
-	if tools, ok := obj["tools"]; ok && desensitizeToolMetadataInPlace(tools, desensitizeMatcherDefault) {
+	if tools, ok := obj["tools"]; ok && desensitizeToolMetadataInPlace(tools, cfg) {
 		changed = true
 	}
 	return changed
 }
 
-func desensitizeMessageInPlace(msg map[string]any, matcher *desensitizeMatcher) bool {
+func desensitizeMessageInPlace(msg map[string]any, cfg *featureRuntimeConfig) bool {
 	role, _ := msg["role"].(string)
 	content, ok := msg["content"]
 	if !ok {
@@ -128,15 +266,15 @@ func desensitizeMessageInPlace(msg map[string]any, matcher *desensitizeMatcher) 
 	case "system", "developer":
 		switch value := content.(type) {
 		case string:
-			return desensitizeStringField(msg, "content", value, matcher)
+			return desensitizeStringField(msg, "content", value, cfg)
 		case []any:
-			return desensitizeTextBlocksInPlace(value, true, matcher)
+			return desensitizeTextBlocksInPlace(value, true, cfg)
 		}
 	case "user":
 		switch value := content.(type) {
 		case string:
 			if hasDesensitizeUserMarker(value) {
-				return desensitizeStringField(msg, "content", value, matcher)
+				return desensitizeStringField(msg, "content", value, cfg)
 			}
 		case []any:
 			var text strings.Builder
@@ -149,14 +287,14 @@ func desensitizeMessageInPlace(msg map[string]any, matcher *desensitizeMatcher) 
 					text.WriteString(value)
 				}
 			}
-			return desensitizeTextBlocksInPlace(value, hasDesensitizeUserMarker(text.String()), matcher)
+			return desensitizeTextBlocksInPlace(value, hasDesensitizeUserMarker(text.String()), cfg)
 		}
 	}
 	return false
 }
 
-func desensitizeStringField(obj map[string]any, key, value string, matcher *desensitizeMatcher) bool {
-	replaced := matcher.replace(value)
+func desensitizeStringField(obj map[string]any, key, value string, cfg *featureRuntimeConfig) bool {
+	replaced := cfg.matcher.replace(value)
 	if replaced == value {
 		return false
 	}
@@ -164,7 +302,7 @@ func desensitizeStringField(obj map[string]any, key, value string, matcher *dese
 	return true
 }
 
-func desensitizeTextBlocksInPlace(content []any, enabled bool, matcher *desensitizeMatcher) bool {
+func desensitizeTextBlocksInPlace(content []any, enabled bool, cfg *featureRuntimeConfig) bool {
 	if !enabled {
 		return false
 	}
@@ -174,27 +312,27 @@ func desensitizeTextBlocksInPlace(content []any, enabled bool, matcher *desensit
 		if !ok || part["type"] != "text" {
 			continue
 		}
-		if text, ok := part["text"].(string); ok && desensitizeStringField(part, "text", text, matcher) {
+		if text, ok := part["text"].(string); ok && desensitizeStringField(part, "text", text, cfg) {
 			changed = true
 		}
 	}
 	return changed
 }
 
-func desensitizeToolMetadataInPlace(value any, matcher *desensitizeMatcher) bool {
+func desensitizeToolMetadataInPlace(value any, cfg *featureRuntimeConfig) bool {
 	switch node := value.(type) {
 	case map[string]any:
 		changed := false
 		for key, value := range node {
 			if key == "description" || key == "title" {
 				if text, ok := value.(string); ok {
-					if desensitizeStringField(node, key, text, matcher) {
+					if desensitizeStringField(node, key, text, cfg) {
 						changed = true
 					}
 					continue
 				}
 			}
-			if desensitizeToolMetadataInPlace(value, matcher) {
+			if desensitizeToolMetadataInPlace(value, cfg) {
 				changed = true
 			}
 		}
@@ -202,7 +340,7 @@ func desensitizeToolMetadataInPlace(value any, matcher *desensitizeMatcher) bool
 	case []any:
 		changed := false
 		for _, item := range node {
-			if desensitizeToolMetadataInPlace(item, matcher) {
+			if desensitizeToolMetadataInPlace(item, cfg) {
 				changed = true
 			}
 		}

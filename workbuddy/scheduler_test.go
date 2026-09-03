@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"testing"
-	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -88,6 +87,7 @@ func TestSchedulerPick_OffMode_Defers(t *testing.T) {
 
 func TestSchedulerPick_SingleCandidate_PicksIt(t *testing.T) {
 	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{"wb-only": modelReady})
 	raw, err := handleSchedulerPick(mustMarshal(t, pluginapi.SchedulerPickRequest{
 		Provider: providerName,
 		Candidates: []pluginapi.SchedulerAuthCandidate{
@@ -108,6 +108,7 @@ func TestSchedulerPick_SingleCandidate_PicksIt(t *testing.T) {
 
 func TestSchedulerPick_PrefersPanelSelection(t *testing.T) {
 	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{"wb-a": modelReady, "wb-b": modelReady})
 	accountCache.Store("wb-a", &accountCacheEntry{credits: &creditsSummary{TotalRemain: 10, TotalSize: 10}})
 	accountCache.Store("wb-b", &accountCacheEntry{credits: &creditsSummary{TotalRemain: 500, TotalSize: 500}})
 	defer func() {
@@ -133,6 +134,7 @@ func TestSchedulerPick_PrefersPanelSelection(t *testing.T) {
 
 func TestSchedulerPick_StaysOnExhaustedSelection(t *testing.T) {
 	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{"wb-exhausted": modelReady, "wb-ok": modelReady})
 	// When selected is exhausted AND a non-exhausted candidate exists,
 	// it should switch to the non-exhausted one and update activeAuthID.
 	accountCache.Store("wb-exhausted", &accountCacheEntry{
@@ -167,6 +169,7 @@ func TestSchedulerPick_StaysOnExhaustedSelection(t *testing.T) {
 
 func TestSchedulerPick_AllExhausted_KeepsCurrent(t *testing.T) {
 	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{"wb-a": modelReady, "wb-b": modelReady})
 	// When ALL candidates are exhausted, keep current selection rather than
 	// flip-flopping between exhausted accounts.
 	accountCache.Store("wb-a", &accountCacheEntry{
@@ -198,6 +201,7 @@ func TestSchedulerPick_AllExhausted_KeepsCurrent(t *testing.T) {
 
 func TestSchedulerPick_SwitchesOnlyWhenSelectionGone(t *testing.T) {
 	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{"wb-ok": modelReady})
 	accountCache.Store("wb-ok", &accountCacheEntry{
 		credits: &creditsSummary{TotalRemain: 300, TotalUsed: 0, TotalSize: 300},
 	})
@@ -224,6 +228,7 @@ func TestSchedulerPick_SwitchesOnlyWhenSelectionGone(t *testing.T) {
 
 func TestSchedulerPick_SkipsDisabledCandidates(t *testing.T) {
 	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{"wb-live": modelReady})
 	accountCache.Store("wb-live", &accountCacheEntry{
 		credits: &creditsSummary{TotalRemain: 50, TotalSize: 50},
 	})
@@ -255,6 +260,53 @@ func TestSchedulerPick_SkipsDisabledCandidates(t *testing.T) {
 	resp2 := parsePickResponse(t, raw2)
 	if resp2.Handled {
 		t.Fatalf("all disabled should defer, got %+v", resp2)
+	}
+}
+
+func TestSchedulerPick_FiltersReadiness(t *testing.T) {
+	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{
+		"wb-ready":       modelReady,
+		"wb-stale":       modelStale,
+		"wb-not-started": modelNotStarted,
+		"wb-loading":     modelLoading,
+		"wb-failed":      modelFailed,
+	})
+	candidates := []pluginapi.SchedulerAuthCandidate{
+		{ID: "wb-ready", Provider: providerName},
+		{ID: "wb-stale", Provider: providerName},
+		{ID: "wb-not-started", Provider: providerName},
+		{ID: "wb-loading", Provider: providerName},
+		{ID: "wb-failed", Provider: providerName},
+	}
+	for _, want := range []string{"wb-ready", "wb-stale"} {
+		setActiveAuthID(want)
+		raw, err := handleSchedulerPick(mustMarshal(t, pluginapi.SchedulerPickRequest{
+			Provider:   providerName,
+			Candidates: candidates,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := parsePickResponse(t, raw); !got.Handled || got.AuthID != want {
+			t.Fatalf("executable candidate %q was filtered: %+v", want, got)
+		}
+	}
+
+	setActiveAuthID("")
+	raw, err := handleSchedulerPick(mustMarshal(t, pluginapi.SchedulerPickRequest{
+		Provider: providerName,
+		Candidates: []pluginapi.SchedulerAuthCandidate{
+			{ID: "wb-not-started", Provider: providerName},
+			{ID: "wb-loading", Provider: providerName},
+			{ID: "wb-failed", Provider: providerName},
+		},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := parsePickResponse(t, raw); got.Handled {
+		t.Fatalf("blocked-only candidates should defer: %+v", got)
 	}
 }
 
@@ -319,119 +371,5 @@ func TestEnsureDefaultActiveAuth_AllExhausted_KeepsCurrent(t *testing.T) {
 	})
 	if id != "a1" {
 		t.Fatalf("all exhausted should keep a1, got %q", id)
-	}
-}
-
-func expiryPick(t *testing.T, active string, entries map[string]*creditsSummary, order ...string) pluginapi.SchedulerPickResponse {
-	t.Helper()
-	setActiveAuthID(active)
-	restoreMode := setSchedulerMode(schedulerModeExpiry)
-	t.Cleanup(func() {
-		setActiveAuthID("")
-		restoreMode()
-	})
-	for id, credits := range entries {
-		accountCache.Store(id, &accountCacheEntry{credits: credits, fetched: time.Now()})
-		id := id
-		t.Cleanup(func() { accountCache.Delete(id) })
-	}
-	candidates := make([]pluginapi.SchedulerAuthCandidate, 0, len(order))
-	for _, id := range order {
-		candidates = append(candidates, pluginapi.SchedulerAuthCandidate{ID: id, Provider: providerName})
-	}
-	raw, err := handleSchedulerPick(mustMarshal(t, pluginapi.SchedulerPickRequest{
-		Provider: providerName, Candidates: candidates,
-	}))
-	if err != nil {
-		t.Fatalf("pick: %v", err)
-	}
-	return parsePickResponse(t, raw)
-}
-
-func TestSchedulerPick_ExpiryUsesMinimumPackageDeadline(t *testing.T) {
-	now := time.Now()
-	fresh := now.Add(-time.Second)
-	entries := map[string]*creditsSummary{
-		"wb-later": {TotalRemain: 20, creditsFetched: fresh, Packages: []packageSummary{
-			{Remain: 10, Status: 0, DeductionEndTime: now.Add(4 * time.Hour).UnixMilli()},
-			{Remain: 10, Status: 0, DeductionEndTime: now.Add(2 * time.Hour).UnixMilli()},
-		}},
-		"wb-sooner": {TotalRemain: 10, creditsFetched: fresh, Packages: []packageSummary{
-			{Remain: 10, Status: 0, DeductionEndTime: now.Add(3 * time.Hour).UnixMilli()},
-		}},
-	}
-	resp := expiryPick(t, "panel", entries, "wb-later", "wb-sooner")
-	if !resp.Handled || resp.AuthID != "wb-later" {
-		t.Fatalf("want account with minimum package deadline, got %+v", resp)
-	}
-	if getActiveAuthID() != "panel" {
-		t.Fatalf("expiry mode changed panel selection to %q", getActiveAuthID())
-	}
-}
-
-func TestSchedulerPick_ExpiryRejectsInvalidPackageWindows(t *testing.T) {
-	now := time.Now()
-	fresh := now.Add(-time.Second)
-	invalid := &creditsSummary{TotalRemain: 40, creditsFetched: fresh, Packages: []packageSummary{
-		{Remain: 10, Status: 0, DeductionEndTime: now.Add(-time.Minute).UnixMilli()},
-		{Remain: 10, Status: 0, DeductionStartTime: now.Add(time.Hour).UnixMilli(), DeductionEndTime: now.Add(2 * time.Hour).UnixMilli()},
-		{Remain: 10, Status: 0, DeductionEndTime: 0},
-		{Remain: 10, Status: 3, DeductionEndTime: now.Add(time.Minute).UnixMilli()},
-	}}
-	valid := &creditsSummary{TotalRemain: 10, creditsFetched: fresh, Packages: []packageSummary{
-		{Remain: 10, Status: 0, DeductionStartTime: 0, DeductionEndTime: now.Add(3 * time.Hour).UnixMilli()},
-	}}
-	resp := expiryPick(t, "", map[string]*creditsSummary{"wb-invalid": invalid, "wb-valid": valid}, "wb-invalid", "wb-valid")
-	if resp.AuthID != "wb-valid" {
-		t.Fatalf("want valid absent-start package, got %+v", resp)
-	}
-}
-
-func TestSchedulerPick_ExpiryFreshKnownBeforeStaleUnknown(t *testing.T) {
-	now := time.Now()
-	known := &creditsSummary{TotalRemain: 1, creditsFetched: now, Packages: []packageSummary{
-		{Remain: 1, Status: 0, DeductionEndTime: now.Add(time.Hour).UnixMilli()},
-	}}
-	stale := &creditsSummary{TotalRemain: 1, creditsFetched: now.Add(-accountCacheTTL - time.Second), Packages: []packageSummary{
-		{Remain: 1, Status: 0, DeductionEndTime: now.Add(time.Minute).UnixMilli()},
-	}}
-	unknown := &creditsSummary{TotalRemain: 1}
-	resp := expiryPick(t, "", map[string]*creditsSummary{"z-known": known, "a-stale": stale, "b-unknown": unknown}, "a-stale", "b-unknown", "z-known")
-	if resp.AuthID != "z-known" {
-		t.Fatalf("fresh known deadline must rank first, got %+v", resp)
-	}
-
-	resp = expiryPick(t, "", map[string]*creditsSummary{"z-stale": stale, "a-unknown": unknown}, "z-stale", "a-unknown")
-	if resp.AuthID != "a-unknown" {
-		t.Fatalf("unknown/stale tie must use auth ID, got %+v", resp)
-	}
-}
-
-func TestSchedulerPick_ExpirySkipsExhaustedAndKeepsAllExhaustedPanel(t *testing.T) {
-	now := time.Now()
-	exhausted := &creditsSummary{TotalRemain: 0, TotalSize: 10, creditsFetched: now}
-	available := &creditsSummary{TotalRemain: 1, creditsFetched: now, Packages: []packageSummary{
-		{Remain: 1, Status: 0, DeductionEndTime: now.Add(time.Hour).UnixMilli()},
-	}}
-	resp := expiryPick(t, "wb-exhausted", map[string]*creditsSummary{"wb-exhausted": exhausted, "wb-ok": available}, "wb-exhausted", "wb-ok")
-	if resp.AuthID != "wb-ok" || getActiveAuthID() != "wb-exhausted" {
-		t.Fatalf("want available without panel mutation, got %+v panel=%q", resp, getActiveAuthID())
-	}
-
-	resp = expiryPick(t, "wb-b", map[string]*creditsSummary{"wb-a": exhausted, "wb-b": exhausted}, "wb-a", "wb-b")
-	if resp.AuthID != "wb-b" || getActiveAuthID() != "wb-b" {
-		t.Fatalf("all exhausted should conservatively keep panel account, got %+v panel=%q", resp, getActiveAuthID())
-	}
-}
-
-func TestSchedulerPick_ExpiryDeadlineTieUsesAuthID(t *testing.T) {
-	now := time.Now()
-	deadline := now.Add(time.Hour).UnixMilli()
-	makeCredits := func() *creditsSummary {
-		return &creditsSummary{TotalRemain: 1, creditsFetched: now, Packages: []packageSummary{{Remain: 1, Status: 0, DeductionEndTime: deadline}}}
-	}
-	resp := expiryPick(t, "panel", map[string]*creditsSummary{"wb-z": makeCredits(), "wb-a": makeCredits()}, "wb-z", "wb-a")
-	if resp.AuthID != "wb-a" || getActiveAuthID() != "panel" {
-		t.Fatalf("deadline tie should pick lexical auth ID without panel mutation, got %+v panel=%q", resp, getActiveAuthID())
 	}
 }

@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
 
 func TestSanitizeBlockedTemplates_ClaudeCode(t *testing.T) {
 	in := "You are Claude Code, Anthropic's official CLI for Claude."
@@ -30,80 +34,81 @@ func TestSanitizeBlockedTemplates_NoMatch(t *testing.T) {
 	}
 }
 
-func TestMapOfficialReasoningEffort(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct{ model, input, want string }{
-		{model: "kimi-k3-1", input: "low", want: "low"},
-		{model: "kimi-k3-1", input: "high", want: "high"},
-		{model: "kimi-k3-1", input: "max", want: "xhigh"},
-		{model: "deepseek-v4-pro", input: "max", want: "xhigh"},
-		{model: "deepseek-v4-flash", input: "max", want: "xhigh"},
-		{model: "glm-5.3", input: "low", want: "low"},
-		{model: "glm-5.3", input: "high", want: "high"},
-		{model: "glm-5.3", input: "max", want: "xhigh"},
-		{model: "glm-5.3-flash", input: "low", want: "low"},
-		{model: "glm-5.3-flash", input: "high", want: "high"},
-		{model: "glm-5.3-flash", input: "xhigh", want: "xhigh"},
-		{model: "glm-5.3-flash", input: "max", want: "xhigh"},
-		{model: "hy3", input: "max", want: "high"},
-		{model: "hy4-preview", input: "none", want: "none"},
-		{model: "hy4-preview", input: "low", want: "none"},
-		{model: "hy4-preview", input: "medium", want: "high"},
-		{model: "hy4-preview", input: "high", want: "high"},
-		{model: "hy4-preview", input: "xhigh", want: "high"},
-		{model: "hy4-preview", input: "max", want: "high"},
-		{model: "hy4-preview-x", input: "none", want: "none"},
-		{model: "hy4-preview-x", input: "low", want: "none"},
-		{model: "hy4-preview-x", input: "medium", want: "high"},
-		{model: "hy4-preview-x", input: "high", want: "high"},
-		{model: "hy4-preview-x", input: "xhigh", want: "high"},
-		{model: "hy4-preview-x", input: "max", want: "high"},
-		{model: "hy3-x", input: "low", want: "low"},
-		{model: "hy3-x", input: "high", want: "high"},
-		{model: "hy3-x", input: "max", want: "high"},
-		{model: "glm-5.1", input: "high", want: "high"},
+func TestSanitizeBlockedTemplates_Fingerprints(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "partial template text remains unchanged",
+			in:   "    You are Claude Code, but this is not the blocked template",
+			want: "    You are Claude Code, but this is not the blocked template",
+		},
+		{
+			name: "ordinary cc assignment",
+			in:   "Set cc_library=foo and keep this sentence",
+			want: "Set cc_library=foo and keep this sentence",
+		},
+		{
+			name: "billing header value irrelevant",
+			in:   "prefix x-anthropic-billing-header: arbitrary=value; suffix",
+			want: "prefix suffix",
+		},
+		{
+			name: "billing header case insensitive",
+			in:   "X-Anthropic-Billing-Header: cc_version=1.0; useful",
+			want: "useful",
+		},
+		{
+			name: "cc fingerprint case insensitive",
+			in:   "semantic; CC_VERSION=2.0; CC_ENTRYPOINT=cli; end",
+			want: "semantic; end",
+		},
+		{
+			name: "multiple trailing cc keys",
+			in:   "semantic; cc_version=2.0; cc_entrypoint=cli; end",
+			want: "semantic; end",
+		},
 	}
 	for _, tt := range tests {
-		obj := map[string]any{"reasoning_effort": tt.input}
-		mapReasoningEffortInPlace(obj, tt.model)
-		if got := obj["reasoning_effort"]; got != tt.want {
-			t.Errorf("model %s effort %s mapped to %v, want %s", tt.model, tt.input, got, tt.want)
-		}
-	}
-}
-func TestWBModelsAdvertiseOfficialOutputLimits(t *testing.T) {
-	t.Parallel()
-
-	want := map[string]int64{
-		"glm-5.3": 131072, "glm-5.3-flash": 131072, "glm-5.2": 131072, "glm-5.1": 131072, "glm-5v-turbo": 131072,
-		"kimi-k3-1": 131072, "kimi-k2.7": 131072, "minimax-m3": 131072,
-		"hy3": 64000, "hy3-x": 64000, "hy3-preview": 64000, "hy3-preview-agent": 64000, "hy4-preview": 64000, "hy4-preview-x": 64000,
-		"deepseek-v4-pro": 393216, "deepseek-v4-flash": 393216,
-	}
-	for _, model := range wbModels() {
-		if model.MaxCompletionTokens != want[model.ID] {
-			t.Errorf("model %s max output = %d, want %d", model.ID, model.MaxCompletionTokens, want[model.ID])
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sanitizeBlockedTemplates(tt.in); got != tt.want {
+				t.Fatalf("sanitizeBlockedTemplates(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
 	}
 }
 
-func TestOfficialModelName(t *testing.T) {
-	t.Parallel()
+func TestPrepareUpstreamBodySanitizesFingerprintsAndPreservesReasoningEffort(t *testing.T) {
+	body := []byte(`{"model":"other-model","reasoning_effort":"low","messages":[{"role":"system","content":"x-anthropic-billing-header: cc_version=1.0; cc_entrypoint=cli; keep me"}]}`)
+	out := prepareUpstreamBody(body, nil, nil, "other-model")
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatal(err)
+	}
+	if obj["reasoning_effort"] != "low" {
+		t.Fatalf("reasoning_effort = %v, want low", obj["reasoning_effort"])
+	}
+	messages := obj["messages"].([]any)
+	content := messages[0].(map[string]any)["content"].(string)
+	if strings.Contains(strings.ToLower(content), "x-anthropic-billing-header") || strings.Contains(strings.ToLower(content), "cc_") {
+		t.Fatalf("fingerprints remain: %q", content)
+	}
+	if !strings.Contains(content, "keep me") {
+		t.Fatalf("semantic text lost: %q", content)
+	}
+}
 
-	// Upstream ships hy3-x with name "Hy3" (identical to hy3); the plugin
-	// must pin a distinct display name so model lists stay unambiguous.
-	if got := officialModelName("hy3-x", "Hy3"); got != "Hy3-X" {
-		t.Errorf("officialModelName(hy3-x) = %q, want Hy3-X", got)
+func TestPrepareUpstreamBodyPreservesCallerReasoningEffort(t *testing.T) {
+	body := []byte(`{"model":"serve-alpha","reasoning_effort":"medium","messages":[]}`)
+	out := prepareUpstreamBody(body, nil, nil, "serve-beta")
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatal(err)
 	}
-	if got := officialModelName("hy3", "Hy3"); got != "Hy3" {
-		t.Errorf("officialModelName(hy3) = %q, want Hy3", got)
-	}
-	if got := officialModelName("glm-5.3", "GLM-5.3"); got != "GLM-5.3" {
-		t.Errorf("officialModelName(glm-5.3) = %q, want GLM-5.3", got)
-	}
-	if got := officialModelName("new-model", ""); got != "new-model" {
-		t.Errorf("officialModelName(new-model, empty) = %q, want new-model", got)
+	if obj["model"] != "serve-beta" || obj["reasoning_effort"] != "medium" {
+		t.Fatalf("rewritten payload = %#v", obj)
 	}
 }
 
