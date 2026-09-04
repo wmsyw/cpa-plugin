@@ -109,6 +109,9 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 	if statusCode >= 400 {
 		// Drain the error body via the same bridge so the message is complete.
 		errPayload, _ := io.ReadAll(newHostStreamReader(stream))
+		if statusCode == 429 || statusCode == 402 || isSoftRateLimit(statusCode, string(errPayload)) || isHardCreditError(statusCode, string(errPayload)) {
+			penalizeAuth(authID, authUID)
+		}
 		publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, string(errPayload))
 		if authUID != "" {
 			go reconcileByUID(authUID, statusCode, string(errPayload))
@@ -156,6 +159,7 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 		return
 	}
 	publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), false, 0, "")
+	clearAuthPenalty(authID, authUID)
 	invalidateAccountCredits(authID, authUID)
 }
 

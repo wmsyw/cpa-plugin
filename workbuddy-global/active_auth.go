@@ -65,20 +65,35 @@ func pickActiveAuth(candidates []activeAuthCandidate) string {
 	}
 
 	cur := getActiveAuthID()
-	// Keep current selection if it's still a live candidate AND not disabled/exhausted.
+	// Keep current selection if it's still a live candidate AND not disabled/exhausted AND unpenalized.
 	if cur != "" {
-		if c, ok := byID[cur]; ok && !c.Disabled && !c.Exhausted {
+		if c, ok := byID[cur]; ok && !c.Disabled && !c.Exhausted && getAuthPenalty(cur) == 0 {
 			return cur
 		}
 	}
-
-	// Selection is gone, disabled or exhausted — pick next non-disabled non-exhausted, else first.
+	// Selection is gone, disabled, exhausted or penalized — pick next non-disabled non-exhausted unpenalized.
 	var next string
 	for _, c := range candidates {
-		if !c.Disabled && !c.Exhausted {
+		if !c.Disabled && !c.Exhausted && getAuthPenalty(c.ID) == 0 {
 			next = c.ID
 			break
 		}
+	}
+	if next == "" {
+		// All non-exhausted candidates are penalized — pick the one penalized longest ago.
+		var bestID string
+		var minPenalty int64 = -1
+		for _, c := range candidates {
+			if c.Disabled || c.Exhausted {
+				continue
+			}
+			p := getAuthPenalty(c.ID)
+			if minPenalty == -1 || p < minPenalty {
+				minPenalty = p
+				bestID = c.ID
+			}
+		}
+		next = bestID
 	}
 	if next == "" {
 		// All exhausted or disabled — keep current if still alive, else first candidate.

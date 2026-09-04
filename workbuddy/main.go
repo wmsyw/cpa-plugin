@@ -357,7 +357,7 @@ func wbRegistration() registration {
 				{Name: "enterprise_credits", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Probe strict CN enterprise credits before personal resource packages (default false; Global unchanged)."},
 				{Name: "management_key", Type: pluginapi.ConfigFieldTypeString, Description: "Optional Bearer key enforced by WorkBuddy for mutating management endpoints; also env WB_MANAGEMENT_KEY."},
 				{Name: "proxy-url", Type: pluginapi.ConfigFieldTypeString, Description: "Optional plugin-level proxy for all WorkBuddy HTTP traffic. Supports http, https, socks5, and socks5h; empty preserves existing routing and host-bridged calls inherit CPA. Invalid settings fail closed. Explicit proxy traffic bypasses CPA request-log."},
-				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{schedulerModeOff, schedulerModeCredits}, Description: "Multi-account selection: off (defer to built-in, default) or credits (pick the panel-selected account, with non-exhausted fallback). WARNING: when off + lifecycle_auto=false, exhausted accounts may still be routed — enable lifecycle_auto or set scheduler_mode=credits."},
+				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{schedulerModeOff, schedulerModeCredits, schedulerModeExpiry}, Description: "Multi-account selection: off (defer to built-in, default) or credits (pick the panel-selected account, with non-exhausted fallback). WARNING: when off + lifecycle_auto=false, exhausted accounts may still be routed — enable lifecycle_auto or set scheduler_mode=credits."},
 				{Name: "usage_report_url", Type: pluginapi.ConfigFieldTypeString, Description: "Optional override of CPAMP usage import URL (default http://cpa-manager-plus:18317/v0/management/usage/import; also env USAGE_REPORT_URL)."},
 				{Name: "usage_report_key", Type: pluginapi.ConfigFieldTypeString, Description: "Optional CPAMP admin key override. Prefer auto-detect from env CPAMP_ADMIN_KEY / USAGE_REPORT_KEY or secret file /run/secrets/cpamp_admin_key."},
 			},
@@ -726,6 +726,9 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	reader := newHostStreamReader(stream)
 	if statusCode >= 400 {
 		payload, _ := io.ReadAll(reader)
+		if statusCode == 429 || statusCode == 402 || isSoftRateLimit(statusCode, string(payload)) || isHardCreditError(statusCode, string(payload)) {
+			penalizeAuth(req.AuthID, authUID)
+		}
 		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, string(payload))
 		reconcileAfterExecutorError(req.AuthID, statusCode, string(payload))
 		return errorEnvelopeWithStatus("http_error", fmt.Sprintf("upstream %d: %s", statusCode, truncateRedacted(string(payload), 200)), statusCode), nil
@@ -736,6 +739,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	publishUsage(req.Model, upstreamModel, authUID, started, usageDetailFromCompletion(completion), false, 0, "")
+	clearAuthPenalty(req.AuthID, authUID)
 	invalidateAccountCredits(req.AuthID, authUID)
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
 }
@@ -782,6 +786,9 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		collector := &sseUsageCollector{}
 		chunks, statusCode, errCollect := collectUpstreamStream(body, sa, sseFramed, collector, req.HostCallbackID)
 		if errCollect != nil {
+			if statusCode == 429 || statusCode == 402 || isSoftRateLimit(statusCode, errCollect.Error()) || isHardCreditError(statusCode, errCollect.Error()) {
+				penalizeAuth(req.AuthID, authUID)
+			}
 			publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, errCollect.Error())
 			var statusErr *upstreamStatusError
 			if errors.As(errCollect, &statusErr) {
@@ -790,6 +797,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 			return nil, errCollect
 		}
 		publishUsage(req.Model, upstreamModel, authUID, started, collector.detail(), false, 0, "")
+		clearAuthPenalty(req.AuthID, authUID)
 		invalidateAccountCredits(req.AuthID, authUID)
 		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
 	}

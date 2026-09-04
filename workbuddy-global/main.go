@@ -747,6 +747,9 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	reader := newHostStreamReader(stream)
 	if statusCode >= 400 {
 		payload, _ := io.ReadAll(reader)
+		if statusCode == 429 || statusCode == 402 || isSoftRateLimit(statusCode, string(payload)) || isHardCreditError(statusCode, string(payload)) {
+			penalizeAuth(req.AuthID, authUID)
+		}
 		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, string(payload), reasoning, 0)
 		reconcileAfterExecutorError(req.AuthID, statusCode, string(payload))
 		return nil, fmt.Errorf("upstream %d: %s", statusCode, truncateRedacted(string(payload), 200))
@@ -757,6 +760,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	publishUsage(req.Model, upstreamModel, authUID, started, usageDetailFromCompletion(completion), false, 0, "", reasoning, 0)
+	clearAuthPenalty(req.AuthID, authUID)
 	invalidateAccountCredits(req.AuthID, authUID)
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
 }
@@ -801,10 +805,14 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		collector := &sseUsageCollector{}
 		chunks, statusCode, errCollect := collectUpstreamStream(body, sa, sseFramed, collector)
 		if errCollect != nil {
+			if statusCode == 429 || statusCode == 402 || isSoftRateLimit(statusCode, errCollect.Error()) || isHardCreditError(statusCode, errCollect.Error()) {
+				penalizeAuth(req.AuthID, authUID)
+			}
 			publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, errCollect.Error(), reasoning, collector.ttftSince(started))
 			return nil, errCollect
 		}
 		publishUsage(req.Model, upstreamModel, authUID, started, collector.detail(), false, 0, "", reasoning, collector.ttftSince(started))
+		clearAuthPenalty(req.AuthID, authUID)
 		invalidateAccountCredits(req.AuthID, authUID)
 		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
 	}

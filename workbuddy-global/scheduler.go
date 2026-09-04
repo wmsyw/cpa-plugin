@@ -3,6 +3,9 @@
 // Credits mode follows the panel-selected account. Expiry mode instead uses
 // fresh cached package metadata to spend credits with the earliest deductible
 // deadline first. Neither scheduler path performs network I/O.
+// When an account encounters 429 / rate limit, penalizeAuth moves it to the
+// back of the candidate line so subsequent requests automatically rotate to
+// the next healthy credential without requiring manual intervention or timers.
 package main
 
 import (
@@ -24,7 +27,56 @@ const (
 var (
 	schedulerMode   = schedulerModeOff
 	schedulerModeMu sync.RWMutex
+
+	authPenaltyMu  sync.RWMutex
+	authPenaltySeq int64
+	authPenalties  = make(map[string]int64)
 )
+
+func normalizeAuthPenaltyKey(id string) string {
+	id = strings.TrimSpace(id)
+	id = strings.TrimSuffix(id, ".json")
+	id = strings.TrimPrefix(id, "wbglobal-")
+	id = strings.TrimPrefix(id, "workbuddy-global-")
+	id = strings.TrimPrefix(id, "workbuddy-")
+	return id
+}
+
+// penalizeAuth records that this auth ID encountered 429 / rate limit / quota failure.
+// Each penalized auth is stamped with an increasing sequence number so it sorts to
+// the back of the candidate queue, yielding its turn to healthy accounts.
+func penalizeAuth(identifiers ...string) {
+	authPenaltyMu.Lock()
+	defer authPenaltyMu.Unlock()
+	authPenaltySeq++
+	for _, raw := range identifiers {
+		if k := normalizeAuthPenaltyKey(raw); k != "" {
+			authPenalties[k] = authPenaltySeq
+		}
+	}
+}
+
+// clearAuthPenalty clears the penalty after an account successfully completes a request.
+func clearAuthPenalty(identifiers ...string) {
+	authPenaltyMu.Lock()
+	defer authPenaltyMu.Unlock()
+	for _, raw := range identifiers {
+		if k := normalizeAuthPenaltyKey(raw); k != "" {
+			delete(authPenalties, k)
+		}
+	}
+}
+
+// getAuthPenalty returns the penalty sequence for an auth ID (0 = unpenalized).
+func getAuthPenalty(id string) int64 {
+	authPenaltyMu.RLock()
+	defer authPenaltyMu.RUnlock()
+	k := normalizeAuthPenaltyKey(id)
+	if k == "" {
+		return 0
+	}
+	return authPenalties[k]
+}
 
 // setSchedulerMode is a test helper that returns a restore func.
 func setSchedulerMode(mode string) func() {
@@ -47,13 +99,6 @@ func loadedSchedulerMode() string {
 
 // handleSchedulerPick selects an enabled WorkBuddy auth candidate. Other
 // providers are always deferred to the built-in scheduler.
-//
-// scheduler_mode:
-//   - "off"     → defer everything to the built-in scheduler.
-//   - "credits" → use the panel-selected account, with its existing sticky
-//     fallback behavior.
-//   - "expiry"  → use fresh cached package deadlines without changing the
-//     panel selection.
 func handleSchedulerPick(raw []byte) ([]byte, error) {
 	var req pluginapi.SchedulerPickRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -93,6 +138,7 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 		}
 		picked = pickActiveAuth(cands)
 	}
+
 	if picked == "" {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
@@ -107,27 +153,26 @@ type expiryCandidate struct {
 	deadline  int64
 	known     bool
 	exhausted bool
+	penalty   int64
 }
 
-// pickExpiryAuth ranks only cached data. Fresh, known package deadlines sort
-// before unknown data, then by earliest deadline and finally by auth ID. It
-// deliberately does not call setActiveAuthID: expiry routing is independent
-// from the account selected in the panel.
+// pickExpiryAuth ranks candidates by penalty first (429 moved to end of queue),
+// then by package expiration deadlines.
 func pickExpiryAuth(candidates []pluginapi.SchedulerAuthCandidate, now time.Time) string {
 	ranked := make([]expiryCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
-		ranked = append(ranked, cachedExpiryCandidate(candidate.ID, now))
+		c := cachedExpiryCandidate(candidate.ID, now)
+		c.penalty = getAuthPenalty(candidate.ID)
+		ranked = append(ranked, c)
 	}
 
-	available := ranked[:0]
+	available := make([]expiryCandidate, 0, len(ranked))
 	for _, candidate := range ranked {
 		if !candidate.exhausted {
 			available = append(available, candidate)
 		}
 	}
 	if len(available) == 0 {
-		// Preserve credits mode's conservative all-exhausted fallback: keep a
-		// live panel selection, otherwise use the host's first candidate.
 		current := getActiveAuthID()
 		for _, candidate := range ranked {
 			if candidate.id == current {
@@ -140,8 +185,17 @@ func pickExpiryAuth(candidates []pluginapi.SchedulerAuthCandidate, now time.Time
 		return ""
 	}
 
-	sort.Slice(available, func(i, j int) bool {
+	sort.SliceStable(available, func(i, j int) bool {
 		left, right := available[i], available[j]
+		// 1. Unpenalized candidates always come before penalized candidates
+		if (left.penalty == 0) != (right.penalty == 0) {
+			return left.penalty == 0
+		}
+		// 2. Among penalized candidates, the one penalized EARLIER comes first
+		if left.penalty != right.penalty {
+			return left.penalty < right.penalty
+		}
+		// 3. Normal expiry ranking
 		if left.known != right.known {
 			return left.known
 		}
@@ -172,7 +226,6 @@ func cachedExpiryCandidate(authID string, now time.Time) expiryCandidate {
 	if candidate.exhausted {
 		return candidate
 	}
-
 	nowMillis := now.UnixMilli()
 	for _, pkg := range credits.Packages {
 		if pkg.Status != 0 || pkg.Remain <= 0 {
@@ -212,8 +265,6 @@ func candidateDisabled(c pluginapi.SchedulerAuthCandidate) bool {
 }
 
 // cachedCreditsScore returns (remain, exhausted) from accountCache.
-// remain is -1 when unknown; exhausted uses isCreditsExhausted.
-// Key is auth.ID (same as SchedulerAuthCandidate.ID and activeAuthID).
 func cachedCreditsScore(authID string) (int64, bool) {
 	v, ok := accountCache.Load(authID)
 	if !ok {

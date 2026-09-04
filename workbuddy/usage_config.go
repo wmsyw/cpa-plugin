@@ -93,8 +93,8 @@ func configure(raw []byte) error {
 	if value, ok := configScalars["lifecycle_auto"]; ok {
 		nextLifecycleAuto = enabledConfigValue(value)
 	}
-	if configScalars["scheduler_mode"] == schedulerModeCredits {
-		nextSchedulerMode = schedulerModeCredits
+	if configScalars["scheduler_mode"] == schedulerModeCredits || configScalars["scheduler_mode"] == schedulerModeExpiry {
+		nextSchedulerMode = configScalars["scheduler_mode"]
 	}
 	cfgURL = configScalars["usage_report_url"]
 	cfgKey = configScalars["usage_report_key"]
