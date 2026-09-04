@@ -554,7 +554,7 @@ func endpointModelsFor(sa *storedAuth) string {
 
 // backendHeaders applies auth-derived headers to a chat completion request.
 // Empty fields are signalled via the X-No-* convention used by CodeBuddy.
-func backendHeaders(req *http.Request, sa *storedAuth) {
+func backendHeaders(req *http.Request, sa *storedAuth, conversationID ...string) {
 	commonHeaders(req)
 	if sa.Auth.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+sa.Auth.AccessToken)
@@ -581,8 +581,21 @@ func backendHeaders(req *http.Request, sa *storedAuth) {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
 	req.Header.Set("X-Product", "SaaS")
-	// Override Origin/Referer for Global accounts so the upstream doesn't
-	// reject the request as cross-origin.
+	req.Header.Set("X-IDE-Type", "CLI")
+	req.Header.Set("X-IDE-Name", "CLI")
+	req.Header.Set("X-IDE-Version", "2.63.2")
+	req.Header.Set("X-Agent-Intent", "craft")
+	req.Header.Set("X-Request-ID", randomHex(16))
+	var cid string
+	if len(conversationID) > 0 && strings.TrimSpace(conversationID[0]) != "" {
+		cid = strings.TrimSpace(conversationID[0])
+	} else {
+		cid = randomHex(16)
+	}
+	req.Header.Set("X-Conversation-ID", cid)
+	req.Header.Set("X-Session-ID", cid)
+	req.Header.Set("X-Conversation-Request-ID", randomHex(16))
+	req.Header.Set("X-Conversation-Message-ID", randomHex(16))
 	origin := originRefererFor(sa)
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
@@ -713,12 +726,16 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	// upstream and fold the chunks into a single chat.completion object.
 	// prepareUpstreamBody does forceStream + normalizeTools + rewriteSystem +
 	// ensureSystemMessage + rewriteModel in ONE unmarshal/marshal pass.
-	body := prepareUpstreamBody(req.Payload, req.OriginalRequest, sa, upstreamModel)
+	convID := resolveConversationID(req.Headers, req.Payload)
+	if convID == "" {
+		convID = resolveConversationID(req.Headers, req.OriginalRequest)
+	}
+	body := prepareUpstreamBody(req.Payload, req.OriginalRequest, sa, upstreamModel, convID)
 	httpReq, err := http.NewRequest(http.MethodPost, endpointChatFor(sa), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	backendHeaders(httpReq, sa)
+	backendHeaders(httpReq, sa, convID)
 	// Compliance: route via host.http.do_stream so request-log captures the
 	// outbound call. Read entire body via the bridge, then fold SSE → completion.
 	stream, statusCode, _, err := hostHTTPDoStream(httpReq)
@@ -773,7 +790,8 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		body = req.OriginalRequest
 	}
 	// Single-pass JSON rewrite (see handleExecExecute for the non-stream path).
-	body = prepareUpstreamBody(body, nil, sa, upstreamModel)
+	convID := resolveConversationID(req.Headers, body)
+	body = prepareUpstreamBody(body, nil, sa, upstreamModel, convID)
 
 	headers := streamHeaders()
 	sseFramed := clientNeedsSSEFrame(req.Metadata)
@@ -804,7 +822,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		streamClose(req.StreamID)
 		return okEnvelope(streamResponse{Headers: headers})
 	}
-	backendHeaders(httpReq, sa)
+	backendHeaders(httpReq, sa, convID)
 	go pumpUpstreamStream(httpReq, cancel, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started, req.AuthID, reasoning)
 	return okEnvelope(streamResponse{Headers: headers})
 }

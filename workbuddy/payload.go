@@ -18,7 +18,7 @@ import (
 // single unmarshal/marshal pass (v0.6.31 perf: was 4-5 full JSON round-trips
 // on every chat completion). The 4 legacy helpers remain for tests and other
 // call sites that need them individually.
-func prepareUpstreamBody(payload, original []byte, sa *storedAuth, upstreamModel string) []byte {
+func prepareUpstreamBody(payload, original []byte, sa *storedAuth, upstreamModel string, conversationID ...string) []byte {
 	src := payload
 	if len(src) == 0 {
 		src = original
@@ -55,6 +55,13 @@ func prepareUpstreamBody(payload, original []byte, sa *storedAuth, upstreamModel
 
 	// 7. ensureSystemMessage: inject minimal system msg for Global only.
 	ensureSystemMessageInPlace(obj, sa)
+
+	// 8. Inject prompt_cache_key for upstream KV Cache routing if missing
+	if len(conversationID) > 0 && strings.TrimSpace(conversationID[0]) != "" {
+		if _, ok := obj["prompt_cache_key"]; !ok {
+			obj["prompt_cache_key"] = strings.TrimSpace(conversationID[0])
+		}
+	}
 
 	out, err := json.Marshal(obj)
 	if err != nil {

@@ -202,6 +202,34 @@ func usageDetailFromMap(m map[string]any) usage.Detail {
 		CachedTokens:    num("cached_tokens"),
 		CacheReadTokens: num("cache_read_input_tokens"),
 	}
+	if d.CacheReadTokens == 0 {
+		d.CacheReadTokens = num("prompt_cache_hit_tokens", "cache_hit_tokens")
+	}
+	if d.CachedTokens == 0 {
+		d.CachedTokens = d.CacheReadTokens
+	}
+	if d.CacheCreationTokens == 0 {
+		d.CacheCreationTokens = num("prompt_cache_write_tokens", "cache_write_tokens")
+	}
+	if d.CacheReadTokens == 0 {
+		if ptd, ok := m["prompt_tokens_details"].(map[string]any); ok {
+			if v, ok2 := ptd["cached_tokens"]; ok2 {
+				switch n := v.(type) {
+				case float64:
+					d.CacheReadTokens = int64(n)
+				case int64:
+					d.CacheReadTokens = n
+				case json.Number:
+					i, _ := n.Int64()
+					d.CacheReadTokens = i
+				}
+				d.CachedTokens = d.CacheReadTokens
+			}
+		}
+	}
+	if d.ReasoningTokens == 0 {
+		d.ReasoningTokens = num("completion_thinking_tokens", "thinking_tokens")
+	}
 	if ct, ok := m["completion_tokens_details"].(map[string]any); ok {
 		if v, ok2 := ct["reasoning_tokens"].(float64); ok2 {
 			d.ReasoningTokens = int64(v)

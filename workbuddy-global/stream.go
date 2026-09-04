@@ -142,7 +142,7 @@ func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool, collecto
 	if err != nil {
 		return nil, 0, err
 	}
-	backendHeaders(httpReq, sa)
+	backendHeaders(httpReq, sa, resolveConversationID(nil, body))
 	// Compliance: route via host.http.do_stream so request-log captures the call.
 	stream, statusCode, _, err := hostHTTPDoStream(httpReq)
 	if err != nil {

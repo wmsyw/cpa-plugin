@@ -60,8 +60,6 @@ import "C"
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -535,7 +533,7 @@ func endpointTokenRefreshFor(sa *storedAuth) string {
 
 // backendHeaders applies auth-derived headers to a chat completion request.
 // Empty fields are signalled via the X-No-* convention used by CodeBuddy.
-func backendHeaders(req *http.Request, sa *storedAuth) {
+func backendHeaders(req *http.Request, sa *storedAuth, conversationID ...string) {
 	commonHeaders(req)
 	if sa.Auth.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+sa.Auth.AccessToken)
@@ -552,41 +550,30 @@ func backendHeaders(req *http.Request, sa *storedAuth) {
 	} else {
 		req.Header.Set("X-No-Enterprise-Id", "1")
 	}
-	// SECURITY: do NOT send X-Refresh-Token on chat completions. refresh_token is
-	// a long-lived credential that can mint new access_tokens; it only belongs on
-	// the refresh endpoint (handleRefreshAuth). Sending it to chat upstream leaks
-	// the credential into upstream request logs on every chat call.
 	if sa.Auth.Domain != "" {
 		req.Header.Set("X-Domain", sa.Auth.Domain)
 	} else {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
 	req.Header.Set("X-Product", "SaaS")
-	// Client-identifying headers. Tencent's billing/usage backend uses these to
-	// populate the "client" (客户端) field; without them requests show as empty.
 	req.Header.Set("X-IDE-Type", "CLI")
 	req.Header.Set("X-IDE-Name", "CLI")
 	req.Header.Set("X-IDE-Version", "2.63.2")
 	req.Header.Set("X-Agent-Intent", "craft")
 	req.Header.Set("X-Request-ID", randomHex(16))
-	req.Header.Set("X-Conversation-ID", randomHex(16))
+	var cid string
+	if len(conversationID) > 0 && strings.TrimSpace(conversationID[0]) != "" {
+		cid = strings.TrimSpace(conversationID[0])
+	} else {
+		cid = randomHex(16)
+	}
+	req.Header.Set("X-Conversation-ID", cid)
+	req.Header.Set("X-Session-ID", cid)
 	req.Header.Set("X-Conversation-Request-ID", randomHex(16))
 	req.Header.Set("X-Conversation-Message-ID", randomHex(16))
-	// Override Origin/Referer for Global accounts so the upstream doesn't
-	// reject the request as cross-origin.
 	origin := originRefererFor(sa)
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
-}
-
-// randomHex returns n random bytes hex-encoded. CodeBuddy conversation/request
-// IDs are 32-char hex strings; this keeps them UUID-free but stable enough.
-func randomHex(n int) string {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%0*x", n*2, time.Now().UnixNano())
-	}
-	return hex.EncodeToString(b)
 }
 
 // -----------------------------------------------------------------------------
@@ -718,12 +705,16 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	// upstream and fold the chunks into a single chat.completion object.
 	// prepareUpstreamBody does forceStream + normalizeTools + rewriteSystem +
 	// ensureSystemMessage + rewriteModel in ONE unmarshal/marshal pass.
-	body := prepareUpstreamBody(req.Payload, req.OriginalRequest, sa, upstreamModel)
+	convID := resolveConversationID(req.Headers, req.Payload)
+	if convID == "" {
+		convID = resolveConversationID(req.Headers, req.OriginalRequest)
+	}
+	body := prepareUpstreamBody(req.Payload, req.OriginalRequest, sa, upstreamModel, convID)
 	httpReq, err := http.NewRequest(http.MethodPost, endpointChatFor(sa), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	backendHeaders(httpReq, sa)
+	backendHeaders(httpReq, sa, convID)
 	// Compliance: route via host.http.do_stream so request-log captures the
 	// outbound call. Read entire body via the bridge, then fold SSE → completion.
 	stream, statusCode, _, err := hostHTTPDoStreamWithCallback(httpReq, req.HostCallbackID)
@@ -780,7 +771,8 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		body = req.OriginalRequest
 	}
 	// Single-pass JSON rewrite (see handleExecExecute for the non-stream path).
-	body = prepareUpstreamBody(body, nil, sa, upstreamModel)
+	convID := resolveConversationID(req.Headers, body)
+	body = prepareUpstreamBody(body, nil, sa, upstreamModel, convID)
 
 	headers := streamHeaders()
 	sseFramed := clientNeedsSSEFrame(req.Metadata)
@@ -815,7 +807,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		streamClose(req.StreamID)
 		return okEnvelope(streamResponse{Headers: headers})
 	}
-	backendHeaders(httpReq, sa)
+	backendHeaders(httpReq, sa, convID)
 	go pumpUpstreamStream(httpReq, cancel, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started, req.AuthID, req.HostCallbackID)
 	return okEnvelope(streamResponse{Headers: headers})
 }
