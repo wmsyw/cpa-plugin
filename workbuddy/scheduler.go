@@ -112,7 +112,7 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 	// Collect workbuddy candidates only.
 	var wbCandidates []pluginapi.SchedulerAuthCandidate
 	for _, c := range req.Candidates {
-		if c.Provider != providerName {
+		if c.Provider != providerName && c.Provider != "workbuddy-global" {
 			continue
 		}
 		if candidateDisabled(c) {

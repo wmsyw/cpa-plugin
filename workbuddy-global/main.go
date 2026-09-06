@@ -352,7 +352,7 @@ func wbRegistration() registration {
 			ExecutorInputFormats:  []string{"chat-completions"},
 			ExecutorOutputFormats: []string{"chat-completions"},
 			ManagementAPI:         true,
-			Scheduler:             true,
+			Scheduler:             false,
 			UsagePlugin:           true,
 		},
 	}
@@ -831,7 +831,11 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		return okEnvelope(streamResponse{Headers: headers})
 	}
 	backendHeaders(httpReq, sa, convID)
-	go pumpUpstreamStream(httpReq, cancel, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started, req.AuthID, reasoning)
+	ready := make(chan error, 1)
+	go pumpUpstreamStream(httpReq, cancel, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started, req.AuthID, reasoning, ready)
+	if errReady := <-ready; errReady != nil {
+		return nil, errReady
+	}
 	return okEnvelope(streamResponse{Headers: headers})
 }
 

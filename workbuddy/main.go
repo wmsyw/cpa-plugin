@@ -816,7 +816,15 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		return okEnvelope(streamResponse{Headers: headers})
 	}
 	backendHeaders(httpReq, sa, convID)
-	go pumpUpstreamStream(httpReq, cancel, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started, req.AuthID, req.HostCallbackID)
+	ready := make(chan error, 1)
+	go pumpUpstreamStream(httpReq, cancel, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started, req.AuthID, req.HostCallbackID, ready)
+	if errReady := <-ready; errReady != nil {
+		var statusErr *upstreamStatusError
+		if errors.As(errReady, &statusErr) {
+			return errorEnvelopeWithStatus("http_error", redactSecrets(statusErr.Error()), statusErr.status), nil
+		}
+		return errorEnvelopeWithStatus("http_error", redactSecrets(errReady.Error()), http.StatusBadGateway), nil
+	}
 	return okEnvelope(streamResponse{Headers: headers})
 }
 

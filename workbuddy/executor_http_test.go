@@ -442,7 +442,7 @@ func TestInboundHandlersForwardHostCallbackID(t *testing.T) {
 			signature: "func handleExecStream(",
 			requirements: []string{
 				"collectUpstreamStream(body, sa, sseFramed, collector, req.HostCallbackID)",
-				"pumpUpstreamStream(httpReq, cancel, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started, req.AuthID, req.HostCallbackID)",
+				"pumpUpstreamStream(httpReq, cancel, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started, req.AuthID, req.HostCallbackID",
 			},
 		},
 		{

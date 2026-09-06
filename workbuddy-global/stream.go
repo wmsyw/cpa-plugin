@@ -24,6 +24,13 @@ import (
 // streamEmit pushes one chunk payload to the host stream. Returns an error if
 // the host rejected it (e.g. the client already disconnected and the stream
 // was closed), which the pump uses to stop reading a dead upstream.
+type upstreamStatusError struct {
+	status  int
+	message string
+}
+
+func (e *upstreamStatusError) Error() string { return e.message }
+
 func streamEmit(streamID string, payload []byte) error {
 	if streamID == "" {
 		return fmt.Errorf("no stream id")
@@ -68,8 +75,12 @@ func streamHeaders() http.Header {
 // the outbound call and host transport policy applies. The host bridge emits
 // arbitrary 32KB chunks, so we adapt to io.Reader and keep the bufio.Scanner
 // SSE line framing unchanged.
-func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, streamID string, sseFramed bool, requestedModel, upstreamModel, authUID string, started time.Time, authID string, reasoning string) {
-	// Always close the host stream exactly once on every exit path.
+func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, streamID string, sseFramed bool, requestedModel, upstreamModel, authUID string, started time.Time, authID string, reasoning string, ready ...chan error) {
+	reportReady := func(err error) {
+		if len(ready) > 0 && ready[0] != nil {
+			ready[0] <- err
+		}
+	}
 	closed := false
 	closeOnce := func() {
 		if closed {
@@ -82,27 +93,35 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 	if cancel != nil {
 		defer cancel()
 	}
-
 	stream, statusCode, _, err := hostHTTPDoStream(httpReq)
 	if err != nil {
 		publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error(), reasoning, 0)
+		if len(ready) > 0 && ready[0] != nil {
+			reportReady(err)
+			return
+		}
 		streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
 		return
 	}
 	defer stream.Close()
 	if statusCode >= 400 {
-		// Drain the error body via the same bridge so the message is complete.
 		errPayload, _ := io.ReadAll(newHostStreamReader(stream))
-		if statusCode == 429 || statusCode == 402 || isSoftRateLimit(statusCode, string(errPayload)) || isHardCreditError(statusCode, string(errPayload)) {
+		errStr := string(errPayload)
+		if statusCode == 429 || statusCode == 402 || isSoftRateLimit(statusCode, errStr) || isHardCreditError(statusCode, errStr) {
 			penalizeAuth(authID, authUID)
 		}
-		publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, string(errPayload), reasoning, 0)
+		publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, errStr, reasoning, 0)
 		if authUID != "" {
-			go reconcileByUID(authUID, statusCode, string(errPayload))
+			go reconcileByUID(authUID, statusCode, errStr)
 		}
-		streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", statusCode, truncateRedacted(string(errPayload), 200)))
+		if len(ready) > 0 && ready[0] != nil {
+			reportReady(&upstreamStatusError{status: statusCode, message: fmt.Sprintf("upstream %d: %s", statusCode, truncateRedacted(errStr, 200))})
+			return
+		}
+		streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", statusCode, truncateRedacted(errStr, 200)))
 		return
 	}
+	reportReady(nil)
 	collector := &sseUsageCollector{}
 	scanner := bufio.NewScanner(newHostStreamReader(stream))
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
