@@ -19,9 +19,9 @@ func TestMapOfficialReasoningEffortCN(t *testing.T) {
 		{model: "glm-5.2", input: "max", want: "xhigh"},
 		{model: "kimi-k3-1", input: "max", want: "xhigh"},
 		{model: "deepseek-v4-pro", input: "max", want: "xhigh"},
-		// Live-probed 2026-09-10: upstream honors max directly for
-		// deepseek-v4.1-flash; the canonical ladder passes through.
-		{model: "deepseek-v4.1-flash", input: "max", want: "max"},
+		// Same family rule as deepseek-v4-pro; xhigh accepted by the CN
+		// gateway (live-probed 2026-09-10).
+		{model: "deepseek-v4.1-flash", input: "max", want: "xhigh"},
 		{model: "deepseek-v4.1-flash", input: "low", want: "low"},
 		{model: "kimi-k2.7", input: "max", want: "max"},
 		{model: "minimax-m3", input: "max", want: "max"},

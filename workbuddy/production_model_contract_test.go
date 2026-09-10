@@ -21,7 +21,7 @@ var effortMapAllowlist = map[string]map[string]bool{
 	"payload.go": {
 		"glm-5.3": true, "glm-5.3-flash": true, "glm-5.2": true,
 		"kimi-k3-1": true, "hy3": true, "hy3-x": true, "hy4-preview": true,
-		"deepseek-v4-pro": true,
+		"deepseek-v4-pro": true, "deepseek-v4.1-flash": true,
 	},
 }
 

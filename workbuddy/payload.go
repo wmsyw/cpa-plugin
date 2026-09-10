@@ -478,7 +478,7 @@ func mapReasoningEffortInPlace(obj map[string]any, model string) bool {
 	}
 	mapped := effort
 	switch model {
-	case "kimi-k3-1", "deepseek-v4-pro", "glm-5.3", "glm-5.3-flash", "glm-5.2":
+	case "kimi-k3-1", "deepseek-v4-pro", "deepseek-v4.1-flash", "glm-5.3", "glm-5.3-flash", "glm-5.2":
 		// These CN routes accept xhigh instead of the canonical max label.
 		if effort == "max" {
 			mapped = "xhigh"
@@ -498,8 +498,8 @@ func mapReasoningEffortInPlace(obj map[string]any, model string) bool {
 			mapped = "high"
 		}
 	}
-	// The remaining catalog models accept the canonical ladder verbatim
-	// (live-probed 2026-09-10) and are intentionally unmapped.
+	// Remaining catalog models accept the canonical ladder verbatim
+	// and are intentionally unmapped.
 	if mapped == effort {
 		return false
 	}
