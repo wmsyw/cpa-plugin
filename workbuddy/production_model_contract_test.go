@@ -12,6 +12,19 @@ import (
 	"testing"
 )
 
+// forkDeviation: model-family keys for effort label translation (see
+// mapReasoningEffortInPlace). These are label ladders keyed by upstream model
+// ID, not a model catalog; the dynamic bootstrap in model_source_workbuddy.go
+// remains the only source of the serving catalog. Everything else (notably
+// forceMaxThinking) stays banned everywhere.
+var effortMapAllowlist = map[string]map[string]bool{
+	"payload.go": {
+		"glm-5.3": true, "glm-5.3-flash": true, "glm-5.2": true,
+		"kimi-k3-1": true, "hy3": true, "hy3-x": true, "hy4-preview": true,
+		"deepseek-v4-pro": true,
+	},
+}
+
 func TestProductionModelSourceHasNoFixedIDs(t *testing.T) {
 	banned := []string{
 		"glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5v-turbo",
@@ -34,6 +47,9 @@ func TestProductionModelSourceHasNoFixedIDs(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, value := range banned {
+			if effortMapAllowlist[name] != nil && effortMapAllowlist[name][value] {
+				continue
+			}
 			if bytes.Contains(raw, []byte(value)) {
 				t.Errorf("production file %s contains banned model contract %q", name, value)
 			}

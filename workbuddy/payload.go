@@ -37,8 +37,10 @@ func prepareUpstreamBody(payload, original []byte, sa *storedAuth, upstreamModel
 	// 2. normalizeTools: tool_choice object form → string; "none" suppresses tools.
 	normalizeToolsInPlace(obj)
 
-	// 3. rewriteModel: swap client model name to upstream model id.
+	// 3. rewriteModel: swap client model name to upstream model id and
+	// translate official reasoning efforts to upstream labels.
 	rewriteModelInPlace(obj, upstreamModel)
+	mapReasoningEffortInPlace(obj, upstreamModel)
 
 	// 4. normalize roles first: both CN and Global gateways reject the
 	// OpenAI-only "developer" role with 11128. Converting before the content
@@ -462,6 +464,47 @@ func hasFingerprint(s string) bool {
 		}
 	}
 	return sanitizeBillingHeaderRE.MatchString(s)
+}
+
+// mapReasoningEffortInPlace translates official-model effort names to the
+// labels accepted by WorkBuddy CN. Clients can therefore consistently send
+// the official values low/medium/high/max. (Restored fork behavior; upstream
+// v0.9.3 forwards reasoning_effort verbatim.)
+func mapReasoningEffortInPlace(obj map[string]any, model string) bool {
+	effort, _ := obj["reasoning_effort"].(string)
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	if effort == "" {
+		return false
+	}
+	mapped := effort
+	switch model {
+	case "kimi-k3-1", "deepseek-v4-pro", "glm-5.3", "glm-5.3-flash", "glm-5.2":
+		// These CN routes accept xhigh instead of the canonical max label.
+		if effort == "max" {
+			mapped = "xhigh"
+		}
+	case "hy3", "hy3-x":
+		// WorkBuddy CN Hunyuan routes only honor high for deep thinking.
+		if effort == "max" {
+			mapped = "high"
+		}
+	case "hy4-preview":
+		// Hy4 Preview exposes only none/high: map the compatible OpenAI
+		// ladder to its no-think/deep-think endpoints.
+		switch effort {
+		case "low":
+			mapped = "none"
+		case "medium", "xhigh", "max":
+			mapped = "high"
+		}
+	}
+	// The remaining catalog models accept the canonical ladder verbatim
+	// (live-probed 2026-09-10) and are intentionally unmapped.
+	if mapped == effort {
+		return false
+	}
+	obj["reasoning_effort"] = mapped
+	return true
 }
 
 // rewriteModelInBody replaces the "model" field of a chat-completions body
