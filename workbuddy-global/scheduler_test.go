@@ -47,6 +47,7 @@ func resetActiveAuth(t *testing.T) {
 
 func TestSchedulerPick_NonWorkbuddy_Defers(t *testing.T) {
 	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{"x": modelReady})
 	raw, err := handleSchedulerPick(mustMarshal(t, pluginapi.SchedulerPickRequest{
 		Provider: "other",
 		Candidates: []pluginapi.SchedulerAuthCandidate{
@@ -88,6 +89,7 @@ func TestSchedulerPick_OffMode_Defers(t *testing.T) {
 
 func TestSchedulerPick_SingleCandidate_PicksIt(t *testing.T) {
 	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{"wb-only": modelReady})
 	raw, err := handleSchedulerPick(mustMarshal(t, pluginapi.SchedulerPickRequest{
 		Provider: providerName,
 		Candidates: []pluginapi.SchedulerAuthCandidate{
@@ -108,6 +110,7 @@ func TestSchedulerPick_SingleCandidate_PicksIt(t *testing.T) {
 
 func TestSchedulerPick_PrefersPanelSelection(t *testing.T) {
 	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{"wb-a": modelReady, "wb-b": modelReady})
 	accountCache.Store("wb-a", &accountCacheEntry{credits: &creditsSummary{TotalRemain: 10, TotalSize: 10}})
 	accountCache.Store("wb-b", &accountCacheEntry{credits: &creditsSummary{TotalRemain: 500, TotalSize: 500}})
 	defer func() {
@@ -133,6 +136,7 @@ func TestSchedulerPick_PrefersPanelSelection(t *testing.T) {
 
 func TestSchedulerPick_StaysOnExhaustedSelection(t *testing.T) {
 	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{"wb-exhausted": modelReady, "wb-ok": modelReady})
 	// When selected is exhausted AND a non-exhausted candidate exists,
 	// it should switch to the non-exhausted one and update activeAuthID.
 	accountCache.Store("wb-exhausted", &accountCacheEntry{
@@ -167,6 +171,7 @@ func TestSchedulerPick_StaysOnExhaustedSelection(t *testing.T) {
 
 func TestSchedulerPick_AllExhausted_KeepsCurrent(t *testing.T) {
 	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{"wb-a": modelReady, "wb-b": modelReady})
 	// When ALL candidates are exhausted, keep current selection rather than
 	// flip-flopping between exhausted accounts.
 	accountCache.Store("wb-a", &accountCacheEntry{
@@ -198,6 +203,7 @@ func TestSchedulerPick_AllExhausted_KeepsCurrent(t *testing.T) {
 
 func TestSchedulerPick_SwitchesOnlyWhenSelectionGone(t *testing.T) {
 	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{"wb-ok": modelReady})
 	accountCache.Store("wb-ok", &accountCacheEntry{
 		credits: &creditsSummary{TotalRemain: 300, TotalUsed: 0, TotalSize: 300},
 	})
@@ -224,6 +230,7 @@ func TestSchedulerPick_SwitchesOnlyWhenSelectionGone(t *testing.T) {
 
 func TestSchedulerPick_SkipsDisabledCandidates(t *testing.T) {
 	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{"a1": modelReady, "a2": modelReady, "a3": modelReady, "wb-live": modelReady, "wb-off": modelReady})
 	accountCache.Store("wb-live", &accountCacheEntry{
 		credits: &creditsSummary{TotalRemain: 50, TotalSize: 50},
 	})
@@ -272,6 +279,7 @@ func TestCandidateDisabled(t *testing.T) {
 
 func TestEnsureDefaultActiveAuth(t *testing.T) {
 	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{})
 	id := ensureDefaultActiveAuth([]wbAccount{
 		{AuthIndex: "a1", AuthID: "a1", Disabled: true},
 		{AuthIndex: "a2", AuthID: "a2", Exhausted: false},
@@ -295,6 +303,7 @@ func TestEnsureDefaultActiveAuth(t *testing.T) {
 
 func TestEnsureDefaultActiveAuth_SwitchesWhenExhausted(t *testing.T) {
 	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{})
 	// Selected a1 is exhausted → should switch to first non-exhausted.
 	setActiveAuthID("a1")
 	id := ensureDefaultActiveAuth([]wbAccount{
@@ -312,6 +321,7 @@ func TestEnsureDefaultActiveAuth_SwitchesWhenExhausted(t *testing.T) {
 
 func TestEnsureDefaultActiveAuth_AllExhausted_KeepsCurrent(t *testing.T) {
 	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{})
 	setActiveAuthID("a1")
 	id := ensureDefaultActiveAuth([]wbAccount{
 		{AuthIndex: "a1", AuthID: "a1", Exhausted: true},
@@ -324,6 +334,11 @@ func TestEnsureDefaultActiveAuth_AllExhausted_KeepsCurrent(t *testing.T) {
 
 func expiryPick(t *testing.T, active string, entries map[string]*creditsSummary, order ...string) pluginapi.SchedulerPickResponse {
 	t.Helper()
+	states := map[string]modelReadinessState{}
+	for _, id := range order {
+		states[id] = modelReady
+	}
+	installModelStatesForTest(t, states)
 	setActiveAuthID(active)
 	restoreMode := setSchedulerMode(schedulerModeExpiry)
 	t.Cleanup(func() {
@@ -425,6 +440,8 @@ func TestSchedulerPick_ExpirySkipsExhaustedAndKeepsAllExhaustedPanel(t *testing.
 }
 
 func TestSchedulerPick_ExpiryDeadlineTieUsesAuthID(t *testing.T) {
+	resetActiveAuth(t)
+	installModelStatesForTest(t, map[string]modelReadinessState{"wb-z": modelReady, "wb-a": modelReady})
 	now := time.Now()
 	deadline := now.Add(time.Hour).UnixMilli()
 	makeCredits := func() *creditsSummary {

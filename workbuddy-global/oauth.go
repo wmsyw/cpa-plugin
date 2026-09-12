@@ -208,7 +208,14 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	// refreshed credential itself after Refresh returns (conductor.go
 	// refreshAuth → m.Update → persist). Writing from the plugin too would
 	// double-write the file.
-	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthDataForRefresh(sa)})
+	response, err := okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthDataForRefresh(sa)})
+	if err != nil {
+		return nil, err
+	}
+	// A refreshed token changes the auth identity hash; drop the cached
+	// readiness state so the next model.for_auth re-bootstraps the catalog.
+	currentModelRuntime().markAuthNotStarted(req.AuthID)
+	return response, nil
 }
 
 // preserveExpiry reuses the previous token's expiresAt when the refresh

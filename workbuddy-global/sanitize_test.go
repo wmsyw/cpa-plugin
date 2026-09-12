@@ -125,46 +125,6 @@ func TestMapOfficialReasoningEffortLeavesUnknownModelUnchanged(t *testing.T) {
 	}
 }
 
-func TestWBModelsAdvertiseOfficialOutputLimits(t *testing.T) {
-	t.Parallel()
-
-	want := map[string]int64{
-		"hy4-preview": 64000, "hy3": 64000,
-		"gpt-5.6-sol": 128000, "gpt-5.6-terra": 128000, "gpt-5.6-luna": 128000,
-		"gpt-5.5": 128000, "gpt-5.4": 128000, "gpt-5.3-codex": 128000,
-		"gemini-3.5-flash": 65536,
-		"glm-5.3":          131072, "glm-5.2": 131072,
-		"kimi-k3": 131072, "kimi-k2.6": 131072, "minimax-m3": 131072,
-	}
-	if len(wbModels()) != len(want) {
-		t.Fatalf("static model count = %d, want %d", len(wbModels()), len(want))
-	}
-	for _, model := range wbModels() {
-		expected, ok := want[model.ID]
-		if !ok {
-			t.Errorf("unexpected static model %s", model.ID)
-			continue
-		}
-		if model.MaxCompletionTokens != expected {
-			t.Errorf("model %s max output = %d, want %d", model.ID, model.MaxCompletionTokens, expected)
-		}
-	}
-}
-
-func TestOfficialModelName(t *testing.T) {
-	t.Parallel()
-
-	if got := officialModelName("hy3", "Hy3"); got != "Hy3" {
-		t.Errorf("officialModelName(hy3) = %q, want Hy3", got)
-	}
-	if got := officialModelName("gpt-5.6-sol", "GPT-5.6-Sol"); got != "GPT-5.6-Sol" {
-		t.Errorf("officialModelName(gpt-5.6-sol) = %q, want GPT-5.6-Sol", got)
-	}
-	if got := officialModelName("new-model", ""); got != "new-model" {
-		t.Errorf("officialModelName(new-model, empty) = %q, want new-model", got)
-	}
-}
-
 func TestTruncate(t *testing.T) {
 	if truncate("hello", 10) != "hello" {
 		t.Fatal("short string should be unchanged")

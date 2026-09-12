@@ -116,6 +116,11 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 		if c.Provider != providerName || candidateDisabled(c) {
 			continue
 		}
+		// Gate on model readiness: auths whose catalog bootstrap failed are
+		// excluded so requests never route to an account without a model list.
+		if !currentModelRuntime().snapshotForAuthID(c.ID).State.executable() {
+			continue
+		}
 		wbCandidates = append(wbCandidates, c)
 	}
 	if len(wbCandidates) == 0 {

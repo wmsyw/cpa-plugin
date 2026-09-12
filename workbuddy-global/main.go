@@ -81,16 +81,17 @@ const (
 
 	// This copy is intentionally Global-only. Every auth, model, billing and
 	// chat request stays on the international WorkBuddy gateway.
-	upstreamBaseGlobal = "https://www.workbuddy.ai"
-	clientUA           = "CLI/2.63.2 CodeBuddy/2.63.2"
-	originReferer      = upstreamBaseGlobal
+	upstreamBaseGlobal  = "https://www.workbuddy.ai"
+	upstreamBaseCN      = "https://copilot.tencent.com"
+	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2"
+	originReferer       = upstreamBaseGlobal
+	originRefererGlobal = upstreamBaseGlobal
 
 	endpointAuthState    = upstreamBaseGlobal + "/v2/plugin/auth/state?platform=CLI"
 	endpointLoginAcct    = upstreamBaseGlobal + "/v2/plugin/login/account?state="
 	endpointAuthToken    = upstreamBaseGlobal + "/v2/plugin/auth/token?state="
 	endpointTokenRefresh = upstreamBaseGlobal + "/v2/plugin/auth/token/refresh"
 	endpointChat         = upstreamBaseGlobal + "/v2/chat/completions"
-	endpointModels       = upstreamBaseGlobal + "/console/enterprises/personal/models"
 
 	loginTTL = 5 * time.Minute
 )
@@ -231,7 +232,9 @@ func hostCall(method string, request []byte) ([]byte, error) {
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
-		configure(request)
+		if err := configure(request); err != nil {
+			return nil, err
+		}
 		return okEnvelope(wbRegistration())
 	case pluginabi.MethodModelStatic:
 		return handleModelStatic(request)
@@ -289,8 +292,9 @@ type envelope struct {
 }
 
 type envelopeError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	HTTPStatus int    `json:"http_status,omitempty"`
 }
 
 type identifierResponse struct {
@@ -356,18 +360,6 @@ func wbRegistration() registration {
 			UsagePlugin:           true,
 		},
 	}
-}
-
-// dynamicModelsCacheTTL bounds how long a fetched model list is reused.
-// model.static / model.for_auth are re-invoked by CPA on every config reload
-// and on each models query; without caching, every reload fans out to one
-// upstream call per account.
-const dynamicModelsCacheTTL = 5 * time.Minute
-
-var dynamicModelsCache struct {
-	sync.RWMutex
-	models  []pluginapi.ModelInfo
-	fetched time.Time
 }
 
 //
@@ -548,10 +540,6 @@ func endpointTokenRefreshFor(sa *storedAuth) string {
 	return upstreamBaseFor(sa) + "/v2/plugin/auth/token/refresh"
 }
 
-func endpointModelsFor(sa *storedAuth) string {
-	return upstreamBaseFor(sa) + "/console/enterprises/personal/models"
-}
-
 // backendHeaders applies auth-derived headers to a chat completion request.
 // Empty fields are signalled via the X-No-* convention used by CodeBuddy.
 func backendHeaders(req *http.Request, sa *storedAuth, conversationID ...string) {
@@ -708,6 +696,9 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	var req pluginapi.ExecutorRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
+	}
+	if blocked := guardExecutorReadiness(req.AuthID); blocked != nil {
+		return blocked, nil
 	}
 	sa, err := parseStored(req.StorageJSON)
 	if err != nil {

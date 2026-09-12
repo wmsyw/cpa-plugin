@@ -478,7 +478,7 @@ func mapReasoningEffortInPlace(obj map[string]any, model string) bool {
 	}
 	mapped := effort
 	switch model {
-	case "kimi-k3-1", "deepseek-v4-pro", "deepseek-v4.1-flash", "glm-5.3", "glm-5.3-flash", "glm-5.2":
+	case "kimi-k2.8-preview", "kimi-k3-1", "deepseek-v4-pro", "deepseek-v4.1-flash", "glm-5.3", "glm-5.3-flash", "glm-5.2":
 		// These CN routes accept xhigh instead of the canonical max label.
 		if effort == "max" {
 			mapped = "xhigh"

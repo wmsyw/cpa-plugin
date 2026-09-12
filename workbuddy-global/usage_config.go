@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+
 	"strings"
 	"sync"
 	"time"
@@ -55,8 +56,15 @@ const defaultUsageReportURL = "http://127.0.0.1:18317/v0/management/usage/import
 const fallbackUsageReportURL = "http://cpa-manager-plus:18317/v0/management/usage/import"
 
 // configure decodes plugin config from the lifecycle request.
-func configure(raw []byte) {
+func configure(raw []byte) error {
 	// Parse config without holding any lock (fixes nested-lock hazard).
+	var configYAML []byte
+	// Validate the config_yaml `models` override FIRST so an invalid list
+	// fails the configure and leaves every prior runtime state untouched.
+	nextFeatures, err := parseFeatureRuntime(nil)
+	if err != nil {
+		return err
+	}
 	nextCheckinAuto := true
 	nextLifecycleAuto := true
 	nextSchedulerMode := schedulerModeOff // reset to default on reconfigure
@@ -68,42 +76,53 @@ func configure(raw []byte) {
 		var req struct {
 			ConfigYAML []byte `json:"config_yaml"`
 		}
-		if err := json.Unmarshal(raw, &req); err == nil {
-			for _, line := range strings.Split(string(req.ConfigYAML), "\n") {
-				line = strings.TrimSpace(line)
-				if strings.HasPrefix(line, "checkin_auto:") {
-					v := strings.TrimSpace(strings.TrimPrefix(line, "checkin_auto:"))
-					nextCheckinAuto = v == "true" || v == "1" || v == "yes" || v == "on"
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return err
+		}
+		configYAML = req.ConfigYAML
+		nextFeatures, err = parseFeatureRuntime(configYAML)
+		if err != nil {
+			return err
+		}
+		for _, rawLine := range strings.Split(string(req.ConfigYAML), "\n") {
+			// Only top-level keys participate; continuation lines inside
+			// multi-line scalars must never flip a setting.
+			if strings.HasPrefix(rawLine, " ") || strings.HasPrefix(rawLine, "\t") {
+				continue
+			}
+			line := strings.TrimSpace(rawLine)
+			if strings.HasPrefix(line, "checkin_auto:") {
+				v := strings.TrimSpace(strings.TrimPrefix(line, "checkin_auto:"))
+				nextCheckinAuto = v == "true" || v == "1" || v == "yes" || v == "on"
+			}
+			if strings.HasPrefix(line, "lifecycle_auto:") {
+				v := strings.TrimSpace(strings.TrimPrefix(line, "lifecycle_auto:"))
+				v = strings.Trim(v, "\"'")
+				nextLifecycleAuto = v == "true" || v == "1" || v == "yes" || v == "on"
+			}
+			if strings.HasPrefix(line, "scheduler_mode:") {
+				v := strings.TrimSpace(strings.TrimPrefix(line, "scheduler_mode:"))
+				v = strings.Trim(v, "\"'")
+				if v == schedulerModeCredits || v == schedulerModeExpiry {
+					nextSchedulerMode = v
 				}
-				if strings.HasPrefix(line, "lifecycle_auto:") {
-					v := strings.TrimSpace(strings.TrimPrefix(line, "lifecycle_auto:"))
-					v = strings.Trim(v, "\"'")
-					nextLifecycleAuto = v == "true" || v == "1" || v == "yes" || v == "on"
-				}
-				if strings.HasPrefix(line, "scheduler_mode:") {
-					v := strings.TrimSpace(strings.TrimPrefix(line, "scheduler_mode:"))
-					v = strings.Trim(v, "\"'")
-					if v == schedulerModeCredits || v == schedulerModeExpiry {
-						nextSchedulerMode = v
-					}
-				}
-				if strings.HasPrefix(line, "usage_report_url:") {
-					v := strings.TrimSpace(strings.TrimPrefix(line, "usage_report_url:"))
-					cfgURL = strings.Trim(v, "\"'")
-				}
-				if strings.HasPrefix(line, "usage_report_key:") {
-					v := strings.TrimSpace(strings.TrimPrefix(line, "usage_report_key:"))
-					cfgKey = strings.Trim(v, "\"'")
-				}
-				if strings.HasPrefix(line, "management_key:") {
-					v := strings.TrimSpace(strings.TrimPrefix(line, "management_key:"))
-					nextMgmtKey = strings.Trim(v, "\"'")
-				}
-				if strings.HasPrefix(line, "token_keepalive:") {
-					v := strings.TrimSpace(strings.TrimPrefix(line, "token_keepalive:"))
-					v = strings.Trim(v, "\"'")
-					nextKeepaliveAuto = v == "true" || v == "1" || v == "yes" || v == "on"
-				}
+			}
+			if strings.HasPrefix(line, "usage_report_url:") {
+				v := strings.TrimSpace(strings.TrimPrefix(line, "usage_report_url:"))
+				cfgURL = strings.Trim(v, "\"'")
+			}
+			if strings.HasPrefix(line, "usage_report_key:") {
+				v := strings.TrimSpace(strings.TrimPrefix(line, "usage_report_key:"))
+				cfgKey = strings.Trim(v, "\"'")
+			}
+			if strings.HasPrefix(line, "management_key:") {
+				v := strings.TrimSpace(strings.TrimPrefix(line, "management_key:"))
+				nextMgmtKey = strings.Trim(v, "\"'")
+			}
+			if strings.HasPrefix(line, "token_keepalive:") {
+				v := strings.TrimSpace(strings.TrimPrefix(line, "token_keepalive:"))
+				v = strings.Trim(v, "\"'")
+				nextKeepaliveAuto = v == "true" || v == "1" || v == "yes" || v == "on"
 			}
 		}
 	}
@@ -136,6 +155,11 @@ func configure(raw []byte) {
 
 	resolveUsageReport(cfgURL, cfgKey)
 	ensureScheduler()
+	// Model runtime: the config_yaml `models` static override participates in
+	// the catalog generation key; committing bumps the generation and
+	// invalidates every cached per-auth readiness snapshot.
+	currentModelRuntime().commitFeatureRuntime(nextFeatures)
+	return nil
 }
 
 // resolveUsageReport fills usageReportURL/key from config → env → secret files.

@@ -18,6 +18,10 @@ func TestMapOfficialReasoningEffortCN(t *testing.T) {
 		{model: "glm-5.3-flash", input: "max", want: "xhigh"},
 		{model: "glm-5.2", input: "max", want: "xhigh"},
 		{model: "kimi-k3-1", input: "max", want: "xhigh"},
+		// Same xhigh-group rule as kimi-k3-1; upstream not yet routable
+		// (11102 as of 2026-09-12), mapping pre-provisioned per user call.
+		{model: "kimi-k2.8-preview", input: "max", want: "xhigh"},
+		{model: "kimi-k2.8-preview", input: "low", want: "low"},
 		{model: "deepseek-v4-pro", input: "max", want: "xhigh"},
 		// Same family rule as deepseek-v4-pro; xhigh accepted by the CN
 		// gateway (live-probed 2026-09-10).

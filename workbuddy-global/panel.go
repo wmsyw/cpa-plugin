@@ -35,10 +35,89 @@ type wbAccount struct {
 // and fetches them lazily via /credits?auth_index=<idx>. This avoids hitting
 // upstream billing APIs for all accounts simultaneously on page load (which
 // causes 500 from rate-limited /v2/billing/meter/get-user-resource).
+// model_status summarizes the dynamic model catalog bootstrap for the panel:
+// per-auth readiness plus the shared models.dev metadata state.
+type modelStatus struct {
+	State             modelReadinessState `json:"state"`
+	Message           string              `json:"message"`
+	MetadataSource    modelSnapshotSource `json:"metadata_source"`
+	MetadataFetchedAt string              `json:"metadata_fetched_at"`
+	Auths             []modelAuthStatus   `json:"auths"`
+}
+
+type modelAuthStatus struct {
+	AuthIndex       string              `json:"auth_index"`
+	State           modelReadinessState `json:"state"`
+	ModelSource     modelSnapshotSource `json:"model_source"`
+	ModelsFetchedAt string              `json:"models_fetched_at"`
+	ErrorCode       modelErrorCode      `json:"error_code"`
+}
+
+var modelStatusMessages = map[modelReadinessState]string{
+	modelReady:      "模型目录已就绪",
+	modelStale:      "模型目录刷新失败，正在使用上次有效缓存",
+	modelFailed:     "模型目录不可用",
+	modelLoading:    "模型目录正在初始化",
+	modelNotStarted: "模型目录尚未初始化",
+}
+
+var modelStatePriority = map[modelReadinessState]int{
+	modelReady:      1,
+	modelStale:      2,
+	modelNotStarted: 3,
+	modelLoading:    4,
+	modelFailed:     5,
+}
+
+func buildModelStatus(files []pluginapi.HostAuthFileEntry) modelStatus {
+	runtime := activeModelRuntime.Load()
+	metadata := modelMetadataStatus{Source: modelSourceNone}
+	if runtime != nil {
+		metadata = runtime.metadataStatus()
+	}
+	state := modelReady
+	if len(files) == 0 {
+		state = modelNotStarted
+	}
+	auths := make([]modelAuthStatus, 0, len(files))
+	for _, file := range files {
+		snapshot := modelReadinessSnapshot{State: modelNotStarted, ModelSource: modelSourceNone}
+		if runtime != nil {
+			snapshot = runtime.snapshotForAuthID(file.ID)
+		}
+		auths = append(auths, modelAuthStatus{
+			AuthIndex:       file.AuthIndex,
+			State:           snapshot.State,
+			ModelSource:     snapshot.ModelSource,
+			ModelsFetchedAt: modelStatusTime(snapshot.ModelsFetchedAt),
+			ErrorCode:       snapshot.ErrorCode,
+		})
+		if modelStatePriority[snapshot.State] > modelStatePriority[state] {
+			state = snapshot.State
+		}
+	}
+	return modelStatus{
+		State:             state,
+		Message:           modelStatusMessages[state],
+		MetadataSource:    metadata.Source,
+		MetadataFetchedAt: modelStatusTime(metadata.FetchedAt),
+		Auths:             auths,
+	}
+}
+
+func modelStatusTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339)
+}
+
+var panelHostAuthList = hostAuthList
+
 func buildDashboardEx(force, fetchCredits bool) map[string]any {
-	files, err := hostAuthList()
+	files, err := panelHostAuthList()
 	if err != nil {
-		return map[string]any{"error": err.Error()}
+		return map[string]any{"error": err.Error(), "model_status": buildModelStatus(nil)}
 	}
 	// Prune cache entries for accounts that no longer exist (auth deleted via
 	// CPA UI) or whose TTL expired long ago. Without this, accountCache grows
@@ -180,7 +259,9 @@ func buildDashboardEx(force, fetchCredits bool) map[string]any {
 	for i := range out {
 		out[i].Selected = out[i].AuthID == activeID
 	}
+	statusFiles := files
 	resp := map[string]any{
+		"model_status":   buildModelStatus(statusFiles),
 		"accounts":       out,
 		"active_auth":    activeID,
 		"checkin_auto":   auto,
